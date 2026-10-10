@@ -33,7 +33,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	macapad
 BUILD		:=	build
-SOURCES		:=	source
+SOURCES		:=	source source/quirc
 DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
@@ -54,7 +54,7 @@ CFLAGS	:=	-g -Wall -Wno-format-truncation -O2 -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 
-CFLAGS	+=	$(INCLUDE) -D__3DS__
+CFLAGS	+=	$(INCLUDE) -D__3DS__ -DQUIRC_FLOAT_TYPE=float
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 

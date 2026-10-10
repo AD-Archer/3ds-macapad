@@ -56,3 +56,7 @@ typedef struct {
 bool picture_load(Picture *pic, const u8 *rgba, int w, int h);
 void picture_free(Picture *pic);
 void picture_draw(const Picture *pic, float x, float y, float w, float h);
+
+// A picture that's updated in place from RGB565 frames, like the camera preview (up to 512x256).
+bool picture_init565(Picture *pic, int w, int h);
+void picture_update565(Picture *pic, const u16 *rgb565);

@@ -13,13 +13,14 @@
 #include "gfx.h"
 #include "http.h"
 #include "macapad.h"
+#include "qrscan.h"
 
 #define SOC_BUFFERSIZE 0x100000
 #define LONG_PRESS_MS 500
 #define ROW_H 36
 #define LIST_TOP 34
 
-typedef enum { SCR_FIND, SCR_PAIR, SCR_MAIN, SCR_LIST, SCR_KEYS } Screen;
+typedef enum { SCR_FIND, SCR_QR, SCR_PAIR, SCR_MAIN, SCR_LIST, SCR_KEYS } Screen;
 
 // What the list on screen is for, so a pick knows where to go.
 typedef enum {
@@ -266,6 +267,7 @@ static void url_label(const char *url, char *out, size_t size) {
 
 static void start_main(void);
 static void start_find(const char *message);
+static void start_qr(void);
 
 static void list_picked(int i) {
 	Item *it = &s_list.items[i];
@@ -911,8 +913,9 @@ static void type_address(void) {
 static void find_tap(touchPosition t) {
 	for (int i = 0; i < s_scan.count && i < 3; i++)
 		if (in(t, 8, FIND_ROW_Y + i * 48, 304, 42)) { start_pair(&s_scan.macs[i]); return; }
-	if (!s_scan.running && in(t, 8, 200, 148, 34)) start_find(NULL);
-	if (in(t, 164, 200, 148, 34)) type_address();
+	if (!s_scan.running && in(t, 8, 200, 96, 34)) start_find(NULL);
+	if (in(t, 112, 200, 96, 34)) type_address();
+	if (in(t, 216, 200, 96, 34)) start_qr();
 }
 
 // The Macapad website as a QR code, for anyone who doesn't have Macapad on their Mac yet.
@@ -949,6 +952,8 @@ static void find_draw_top(void) {
 	text(20, 80, 0.48f, C_TEXT2, 0, "Open Macapad on your Mac,");
 	text(20, 98, 0.48f, C_TEXT2, 0, "and keep both on the");
 	text(20, 116, 0.48f, C_TEXT2, 0, "same Wi-Fi.");
+	text(20, 146, 0.44f, C_TEXT3, 0, "Or tap Scan code to scan the");
+	text(20, 162, 0.44f, C_TEXT3, 0, "QR code Macapad shows.");
 
 	float qs = 29 * 3 + 12, qx = TOP_W - 24 - qs, qy = 28;
 	draw_qr(s_siteQr, 29, qx, qy, 3);
@@ -979,11 +984,89 @@ static void find_draw_bottom(void) {
 	if (!s_scan.running && !s_scan.count)
 		text(BOTTOM_W / 2, 110, 0.46f, C_TEXT2, C2D_AlignCenter, "Is Macapad open on your Mac?");
 	if (!s_scan.running) {
-		rrect(8, 200, 148, 34, 10, C_CARD);
-		text(82, 209, 0.46f, C_BLUE, C2D_AlignCenter, "Look again");
+		rrect(8, 200, 96, 34, 10, C_CARD);
+		text_fit(56, 210, 0.42f, C_BLUE, C2D_AlignCenter, 88, "Look again");
 	}
-	rrect(164, 200, 148, 34, 10, C_CARD);
-	text(238, 209, 0.46f, C_BLUE, C2D_AlignCenter, "Type address");
+	rrect(112, 200, 96, 34, 10, C_CARD);
+	text_fit(160, 210, 0.42f, C_BLUE, C2D_AlignCenter, 88, "Type address");
+	rrect(216, 200, 96, 34, 10, C_CARD);
+	text_fit(264, 210, 0.42f, C_BLUE, C2D_AlignCenter, 88, "Scan code");
+}
+
+// ---- scanning the Mac's QR code ----------------------------------------------------
+
+static Picture s_camera;
+static u16 *s_cameraFrame;
+static char s_qrMessage[96];
+
+static void stop_qr(void) {
+	qrscan_stop();
+	picture_free(&s_camera);
+	free(s_cameraFrame);
+	s_cameraFrame = NULL;
+}
+
+static void start_qr(void) {
+	scan_finish(&s_scan);
+	pair_finish(&s_pair);
+	s_qrMessage[0] = 0;
+	s_cameraFrame = malloc(QRSCAN_PREVIEW_W * QRSCAN_PREVIEW_H * sizeof(u16));
+	if (!s_cameraFrame || !picture_init565(&s_camera, QRSCAN_PREVIEW_W, QRSCAN_PREVIEW_H) || !qrscan_start()) {
+		stop_qr();
+		start_find("Can't start the camera.");
+		return;
+	}
+	s_screen = SCR_QR;
+}
+
+static void qr_update(u32 down, touchPosition t, bool tapped) {
+	if ((down & KEY_B) || (tapped && in(t, 8, 196, 304, 38))) {
+		stop_qr();
+		start_find(NULL);
+		return;
+	}
+	if (qrscan_preview(s_cameraFrame)) picture_update565(&s_camera, s_cameraFrame);
+	char link[1024];
+	if (!qrscan_take(link, sizeof link)) return;
+	if (pair_qr_start(&s_pair, link)) {
+		stop_qr();
+		s_screen = SCR_PAIR;
+	} else {
+		copy(s_qrMessage, sizeof s_qrMessage, "That's not a Macapad pairing code.");
+	}
+}
+
+static void qr_draw_top(void) {
+	float x = (TOP_W - QRSCAN_PREVIEW_W) / 2.0f;
+	picture_draw(&s_camera, x, 0, QRSCAN_PREVIEW_W, QRSCAN_PREVIEW_H);
+	// corner marks to aim with
+	u32 c = C_TEXT;
+	float l = 22, th = 3, bx = x + 70, by = 30, bw = QRSCAN_PREVIEW_W - 140, bh = SCREEN_H - 60;
+	C2D_DrawRectSolid(bx, by, 0.5f, l, th, c);
+	C2D_DrawRectSolid(bx, by, 0.5f, th, l, c);
+	C2D_DrawRectSolid(bx + bw - l, by, 0.5f, l, th, c);
+	C2D_DrawRectSolid(bx + bw - th, by, 0.5f, th, l, c);
+	C2D_DrawRectSolid(bx, by + bh - th, 0.5f, l, th, c);
+	C2D_DrawRectSolid(bx, by + bh - l, 0.5f, th, l, c);
+	C2D_DrawRectSolid(bx + bw - l, by + bh - th, 0.5f, l, th, c);
+	C2D_DrawRectSolid(bx + bw - th, by + bh - l, 0.5f, th, l, c);
+	if (s_qrMessage[0]) {
+		float w = text_width(s_qrMessage, 0.46f) + 28;
+		rrect(TOP_W / 2 - w / 2, 196, w, 30, 15, C_RED);
+		text(TOP_W / 2, 203, 0.46f, C_TEXT, C2D_AlignCenter, s_qrMessage);
+	}
+}
+
+static void qr_draw_bottom(void) {
+	header("Scan code", NULL);
+	text(20, 46, 0.48f, C_TEXT, 0, "1. On your Mac, click Macapad in");
+	text(20, 64, 0.48f, C_TEXT, 0, "    the menu bar.");
+	text(20, 88, 0.48f, C_TEXT, 0, "2. Choose Pair with QR Code\xE2\x80\xA6");
+	text(20, 112, 0.48f, C_TEXT, 0, "3. Point the camera on the back");
+	text(20, 130, 0.48f, C_TEXT, 0, "    of this 3DS at the code.");
+	text(BOTTOM_W / 2, 162, 0.42f, C_TEXT3, C2D_AlignCenter, "Hold it about a foot away, straight on.");
+	rrect(8, 196, 304, 38, 10, C_CARD);
+	text(BOTTOM_W / 2, 206, 0.5f, C_RED, C2D_AlignCenter, "Cancel");
 }
 
 static void pair_update(u32 down, touchPosition t, bool tapped) {
@@ -997,8 +1080,13 @@ static void pair_update(u32 down, touchPosition t, bool tapped) {
 	if ((down & KEY_B) || (tapped && in(t, 8, 196, 304, 38))) {
 		pair_finish(&s_pair);
 		if (finished && !(down & KEY_B)) {
-			FoundMac mac = s_pair.mac;
-			start_pair(&mac);  // "Try again"
+			// "Try again"
+			if (s_pair.viaQr) {
+				start_qr();
+			} else {
+				FoundMac mac = s_pair.mac;
+				start_pair(&mac);
+			}
 		} else {
 			start_find(NULL);
 		}
@@ -1106,6 +1194,9 @@ int main(void) {
 		case SCR_FIND:
 			if (tapped) find_tap(tap);
 			break;
+		case SCR_QR:
+			qr_update(down, tap, tapped);
+			break;
 		case SCR_PAIR:
 			pair_update(down, tap, tapped);
 			break;
@@ -1136,6 +1227,7 @@ int main(void) {
 		C2D_TargetClear(top, C_BG);
 		C2D_SceneBegin(top);
 		if (s_screen == SCR_FIND) find_draw_top();
+		else if (s_screen == SCR_QR) qr_draw_top();
 		else if (s_screen == SCR_PAIR) pair_draw_top();
 		else draw_dashboard();
 
@@ -1143,6 +1235,7 @@ int main(void) {
 		C2D_SceneBegin(bottom);
 		switch (s_screen) {
 		case SCR_FIND: find_draw_bottom(); break;
+		case SCR_QR: qr_draw_bottom(); break;
 		case SCR_PAIR: pair_draw_bottom(); break;
 		case SCR_MAIN: pad_draw(); break;
 		case SCR_LIST: list_draw(); break;
@@ -1152,6 +1245,7 @@ int main(void) {
 	}
 
 	scan_finish(&s_scan);
+	stop_qr();
 	pair_finish(&s_pair);
 	catalog_finish(&s_catalog);
 	macapad_stop();

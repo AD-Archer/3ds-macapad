@@ -138,9 +138,17 @@ typedef struct {
 	volatile PairState state;
 	char code[8];
 	char error[128];
+
+	// From the QR code the Mac shows: no code to check, the key pairs right away
+	bool viaQr;
+	char qrKey[80];
+	int urlCount;
+	char urls[4][64];  // "http://192.168.1.5:7317", best first
 } Pairing;
 
 void pair_start(Pairing *pair);
+// Pairs with a "macapad://pair?..." link read from the Mac's QR code. False if it isn't one.
+bool pair_qr_start(Pairing *pair, const char *link);
 void pair_finish(Pairing *pair);
 
 // ---- catalog for the key editor ----------------------------------------------

@@ -192,6 +192,12 @@ static int pow2(int n) {
 	return p;
 }
 
+// Where pixel (x, y) goes in a texture tw wide: the GPU wants 8x8 tiles in Morton order.
+static inline u32 tiled(int x, int y, int tw) {
+	return (((y >> 3) * (tw >> 3) + (x >> 3)) << 6) +
+		((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
+}
+
 bool picture_load(Picture *pic, const u8 *rgba, int w, int h) {
 	picture_free(pic);
 	if (!rgba || w <= 0 || h <= 0 || w > 256 || h > 256) return false;
@@ -204,9 +210,7 @@ bool picture_load(Picture *pic, const u8 *rgba, int w, int h) {
 	for (int y = 0; y < h; y++) {
 		for (int x = 0; x < w; x++) {
 			const u8 *p = rgba + (y * w + x) * 4;
-			u32 i = (((y >> 3) * (tw >> 3) + (x >> 3)) << 6) +
-				((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
-			dst[i] = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+			dst[tiled(x, y, tw)] = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
 		}
 	}
 	C3D_TexFlush(&pic->tex);
@@ -214,6 +218,28 @@ bool picture_load(Picture *pic, const u8 *rgba, int w, int h) {
 	pic->img = (C2D_Image){&pic->tex, &pic->sub};
 	pic->ok = true;
 	return true;
+}
+
+bool picture_init565(Picture *pic, int w, int h) {
+	picture_free(pic);
+	if (w <= 0 || h <= 0 || w > 512 || h > 256) return false;
+	int tw = pow2(w), th = pow2(h);
+	if (!C3D_TexInit(&pic->tex, tw, th, GPU_RGB565)) return false;
+	C3D_TexSetFilter(&pic->tex, GPU_LINEAR, GPU_LINEAR);
+	memset(pic->tex.data, 0, tw * th * 2);
+	pic->sub = (Tex3DS_SubTexture){(u16)w, (u16)h, 0.0f, 1.0f, (float)w / tw, 1.0f - (float)h / th};
+	pic->img = (C2D_Image){&pic->tex, &pic->sub};
+	pic->ok = true;
+	return true;
+}
+
+void picture_update565(Picture *pic, const u16 *rgb565) {
+	if (!pic->ok) return;
+	u16 *dst = pic->tex.data;
+	int w = pic->sub.width, h = pic->sub.height, tw = pic->tex.width;
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) dst[tiled(x, y, tw)] = rgb565[y * w + x];
+	C3D_TexFlush(&pic->tex);
 }
 
 void picture_free(Picture *pic) {

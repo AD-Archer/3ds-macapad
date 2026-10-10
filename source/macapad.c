@@ -696,7 +696,102 @@ static void pair_thread(void *arg) {
 	pair->running = false;
 }
 
+// Pairing with the QR code: POST the key to each address in the link until one answers.
+static void pair_qr_thread(void *arg) {
+	Pairing *pair = arg;
+	char name[64], body[256];
+	device_name(name, sizeof name);
+	json_t *req = json_pack("{s:s,s:s,s:s}", "key", pair->qrKey, "name", name, "app", "Macapad for 3DS");
+	char *text = json_dumps(req, JSON_COMPACT);
+	json_decref(req);
+	copy(body, sizeof body, text);
+	free(text);
+
+	bool reached = false;
+	for (int i = 0; i < pair->urlCount && !pair->cancel && !reached; i++) {
+		char host[64];
+		int port;
+		HttpResponse res;
+		if (!url_split(pair->urls[i], host, sizeof host, &port)) continue;
+		if (!http_request("POST", host, port, "/api/pair/qr", NULL, body, &res, 4000)) continue;
+		reached = true;
+		json_t *root = json_loadb(res.body, res.len, 0, NULL);
+		const char *token = jstr(root, "token");
+		if (res.status == 200 && *token) {
+			json_t *mac = json_object_get(root, "mac");
+			copy(pair->mac.host, sizeof pair->mac.host, host);
+			pair->mac.port = port;
+			if (*jstr(mac, "name")) copy(pair->mac.name, sizeof pair->mac.name, jstr(mac, "name"));
+			if (*jstr(mac, "id")) copy(pair->mac.macId, sizeof pair->mac.macId, jstr(mac, "id"));
+			snprintf(g_config.url, sizeof g_config.url, "http://%s:%d", host, port);
+			copy(g_config.token, sizeof g_config.token, token);
+			copy(g_config.macId, sizeof g_config.macId, pair->mac.macId);
+			copy(g_config.macName, sizeof g_config.macName, pair->mac.name);
+			config_save();
+			pair->state = PAIR_APPROVED;
+		} else {
+			const char *msg = jstr(json_object_get(root, "error"), "message");
+			copy(pair->error, sizeof pair->error, *msg ? msg : "Your Mac said no.");
+			pair->state = PAIR_FAILED;
+		}
+		json_decref(root);
+		http_free(&res);
+	}
+	if (!reached && !pair->cancel) {
+		copy(pair->error, sizeof pair->error, "Can't reach your Mac. Are both on the same Wi-Fi?");
+		pair->state = PAIR_FAILED;
+	}
+	pair->running = false;
+}
+
+// "%20" -> " ", in place
+static void percent_decode(char *s) {
+	char *out = s;
+	for (; *s; s++) {
+		int hi, lo;
+		if (*s == '%' && s[1] && s[2] && sscanf(s + 1, "%1x%1x", &hi, &lo) == 2) {
+			*out++ = (char)(hi << 4 | lo);
+			s += 2;
+		} else {
+			*out++ = *s;
+		}
+	}
+	*out = 0;
+}
+
+bool pair_qr_start(Pairing *pair, const char *link) {
+	static const char prefix[] = "macapad://pair?";
+	if (strncmp(link, prefix, sizeof prefix - 1) != 0) return false;
+	memset(&pair->mac, 0, sizeof pair->mac);
+	pair->qrKey[0] = 0;
+	pair->urlCount = 0;
+	char query[1024];
+	copy(query, sizeof query, link + sizeof prefix - 1);
+	char *save = NULL;
+	for (char *kv = strtok_r(query, "&", &save); kv; kv = strtok_r(NULL, "&", &save)) {
+		char *eq = strchr(kv, '=');
+		if (!eq) continue;
+		*eq = 0;
+		char *value = eq + 1;
+		percent_decode(value);
+		if (!strcmp(kv, "key")) copy(pair->qrKey, sizeof pair->qrKey, value);
+		else if (!strcmp(kv, "name")) copy(pair->mac.name, sizeof pair->mac.name, value);
+		else if (!strcmp(kv, "id")) copy(pair->mac.macId, sizeof pair->mac.macId, value);
+		else if (!strcmp(kv, "url") && pair->urlCount < 4) copy(pair->urls[pair->urlCount++], sizeof pair->urls[0], value);
+	}
+	if (!pair->qrKey[0] || !pair->urlCount) return false;
+	if (!pair->mac.name[0]) copy(pair->mac.name, sizeof pair->mac.name, "your Mac");
+	pair->viaQr = true;
+	pair->running = true;
+	pair->cancel = false;
+	pair->state = PAIR_STARTING;
+	pair->code[0] = pair->error[0] = 0;
+	s_pairThread = spawn(pair_qr_thread, pair);
+	return true;
+}
+
 void pair_start(Pairing *pair) {
+	pair->viaQr = false;
 	pair->running = true;
 	pair->cancel = false;
 	pair->state = PAIR_STARTING;
