@@ -7,7 +7,16 @@ A [Macapad](https://github.com/ad-archer/macapad) frontend for the Nintendo 3DS.
 - **Bottom screen:** a 4×3 pad of keys, in pages. A key can run a Mac action, open an app (with its icon), open a
   website, press a keyboard shortcut or run a Shortcut.
 
+| Dashboard and keys | Finding your Mac |
+|---|---|
+| <img src="screenshots/dashboard.png" width="380" alt="Top screen: clock, weather, the song playing and the Mac's CPU, memory, battery and disk. Bottom screen: a page of media keys."> | <img src="screenshots/find.png" width="380" alt="Find your Mac: instructions, a QR code for the Macapad website, and the scan in progress."> |
+
+Screenshots are from the Azahar emulator, whose stand-in font spaces letters widely; a real 3DS draws them normally.
+
 Needs Macapad with `GET /api/status` (0.4+), on the same Wi-Fi as the 3DS. A 3DS can't join a tailnet.
+
+**Don't have Macapad on your Mac yet?** Get it at **[ad-archer.github.io/Macapad](https://ad-archer.github.io/Macapad/)**.
+The 3DS's "Find your Mac" screen shows a QR code for that page too.
 
 ## Install with FBI
 
@@ -88,3 +97,12 @@ Circles are drawn as triangle fans rather than with citro2d's ellipse calls, whi
 
 [Azahar](https://github.com/azahar-emu/azahar) runs it (`Azahar.app/Contents/MacOS/azahar macapad.3dsx`), and its
 network calls reach the Mac's localhost. Its replacement system font spaces letters widely; a real 3DS looks normal.
+
+## License
+
+Copyright (C) 2026 Antonio Archer
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text.

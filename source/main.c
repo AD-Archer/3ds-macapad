@@ -915,12 +915,52 @@ static void find_tap(touchPosition t) {
 	if (in(t, 164, 200, 148, 34)) type_address();
 }
 
+// The Macapad website as a QR code, for anyone who doesn't have Macapad on their Mac yet.
+// 29x29 modules, a row per u32 (bit 28 = leftmost), made with
+//   qrencode -l M -m 0 -t ASCII "https://ad-archer.github.io/Macapad/"
+static const u32 s_siteQr[29] = {
+	0x1FCBD27F, 0x10567E41, 0x1744E15D, 0x1744C45D,
+	0x1756765D, 0x104BA241, 0x1FD5557F, 0x0000FB00,
+	0x15405C12, 0x06895149, 0x155E8877, 0x191A2AE2,
+	0x04C51BCB, 0x133C91C9, 0x1960547B, 0x0293ED5A,
+	0x14C349CB, 0x0F2951ED, 0x17CC8913, 0x0A052D8A,
+	0x105B1FF0, 0x00149317, 0x1FC34B5B, 0x104CCF1A,
+	0x175C51F3, 0x174B5337, 0x175B4139, 0x1046AD02,
+	0x1FD99BD3
+};
+
+// A QR code at (x, y), m px per module, on white with a 2-module margin.
+static void draw_qr(const u32 *rows, int n, float x, float y, float m) {
+	float margin = 2 * m;
+	rrect(x, y, n * m + 2 * margin, n * m + 2 * margin, 4, C_TEXT);
+	for (int r = 0; r < n; r++) {
+		// a run of dark modules is one rectangle
+		for (int c = 0; c < n; ) {
+			if (!(rows[r] >> (n - 1 - c) & 1)) { c++; continue; }
+			int start = c;
+			while (c < n && rows[r] >> (n - 1 - c) & 1) c++;
+			C2D_DrawRectSolid(x + margin + start * m, y + margin + r * m, 0.5f, (c - start) * m, m, C_BG);
+		}
+	}
+}
+
 static void find_draw_top(void) {
-	text(TOP_W / 2, 50, 0.9f, C_TEXT, C2D_AlignCenter, "Find your Mac");
-	text(TOP_W / 2, 96, 0.48f, C_TEXT2, C2D_AlignCenter, "Open Macapad on your Mac, and keep both");
-	text(TOP_W / 2, 114, 0.48f, C_TEXT2, C2D_AlignCenter, "on the same Wi-Fi.");
-	if (s_findMessage[0]) text_fit(TOP_W / 2, 160, 0.48f, C_ORANGE, C2D_AlignCenter, 370, s_findMessage);
-	if (gethostid() == 0) text(TOP_W / 2, 190, 0.48f, C_RED, C2D_AlignCenter, "This 3DS isn't on Wi-Fi.");
+	text(20, 34, 0.9f, C_TEXT, 0, "Find your Mac");
+	text(20, 80, 0.48f, C_TEXT2, 0, "Open Macapad on your Mac,");
+	text(20, 98, 0.48f, C_TEXT2, 0, "and keep both on the");
+	text(20, 116, 0.48f, C_TEXT2, 0, "same Wi-Fi.");
+
+	float qs = 29 * 3 + 12, qx = TOP_W - 24 - qs, qy = 28;
+	draw_qr(s_siteQr, 29, qx, qy, 3);
+	// centered under the code, but kept on screen when the font runs wide
+	const char *site = "ad-archer.github.io/Macapad";
+	float cx = qx + qs / 2, half = text_width(site, 0.36f) / 2;
+	if (cx + half > TOP_W - 10) cx = TOP_W - 10 - half;
+	text(cx, qy + qs + 6, 0.45f, C_TEXT, C2D_AlignCenter, "No Macapad yet?");
+	text(cx, qy + qs + 23, 0.36f, C_TEXT2, C2D_AlignCenter, site);
+
+	if (s_findMessage[0]) text_fit(TOP_W / 2, 196, 0.48f, C_ORANGE, C2D_AlignCenter, 370, s_findMessage);
+	if (gethostid() == 0) text(TOP_W / 2, 216, 0.48f, C_RED, C2D_AlignCenter, "This 3DS isn't on Wi-Fi.");
 }
 
 static void find_draw_bottom(void) {
