@@ -3,3 +3,5 @@ build/
 *.smdh
 *.elf
 *.map
+.cia-tools/
+*.cia

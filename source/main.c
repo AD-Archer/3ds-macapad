@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <citro2d.h>
 #include <malloc.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -640,6 +641,12 @@ static void fmt_bytes(char *out, size_t size, double bytes) {
 	else snprintf(out, size, "%.1f GB", gb);
 }
 
+// The header: time, date and the Mac on the left; the weather on the right.
+// Big and small text share a baseline so "PM" and "°" sit level with the digits.
+#define HEAD_BASE 40
+#define HEAD_LINE2 47
+#define HEAD_LINE3 63
+
 static void draw_clock(void) {
 	time_t now;
 	if (s_st.have && s_st.macTime) now = (s_st.macTime + (s64)(osGetTime() - s_st.receivedAt)) / 1000 + s_st.utcOffset;
@@ -649,21 +656,89 @@ static void draw_clock(void) {
 	int hour = tm->tm_hour;
 	if (!g_config.clock24) hour = hour % 12 ? hour % 12 : 12;
 	snprintf(clock, sizeof clock, g_config.clock24 ? "%02d:%02d" : "%d:%02d", hour, tm->tm_min);
-	text(14, 0, 1.55f, C_TEXT, 0, clock);
-	if (!g_config.clock24) text(18 + text_width(clock, 1.55f), 28, 0.55f, C_TEXT2, 0, tm->tm_hour < 12 ? "AM" : "PM");
+	text(14, HEAD_BASE, 1.3f, C_TEXT, C2D_AtBaseline, clock);
+	if (!g_config.clock24)
+		text(18 + text_width(clock, 1.3f), HEAD_BASE, 0.5f, C_TEXT2, C2D_AtBaseline, tm->tm_hour < 12 ? "AM" : "PM");
 	snprintf(date, sizeof date, "%s, %s %d", s_days[tm->tm_wday], s_months[tm->tm_mon], tm->tm_mday);
-	text(16, 50, 0.52f, C_TEXT2, 0, date);
+	text(15, HEAD_LINE2, 0.5f, C_TEXT2, 0, date);
 }
 
 static void draw_mac_line(void) {
 	const char *name = s_st.macName[0] ? s_st.macName : g_config.macName;
 	u32 dot = !s_st.have ? C_TEXT3 : s_st.online ? C_GREEN : C_RED;
-	float w = text_width(name, 0.46f);
-	if (w > 170) w = 170;
-	text_fit(TOP_W - 14, 10, 0.46f, C_TEXT2, C2D_AlignRight, 170, name);
-	disc(TOP_W - 22 - w, 18, 3.5f, dot);
-	if (s_st.have && !s_st.online) text(TOP_W - 14, 28, 0.42f, C_RED, C2D_AlignRight, "Can't reach your Mac");
-	else if (s_st.frontApp[0]) text_fit(TOP_W - 14, 28, 0.42f, C_TEXT3, C2D_AlignRight, 170, s_st.frontApp);
+	disc(19, HEAD_LINE3 + 7, 3, dot);
+	char line[160];
+	if (s_st.have && !s_st.online) {
+		text(27, HEAD_LINE3, 0.42f, C_RED, 0, "Can't reach your Mac");
+		return;
+	}
+	snprintf(line, sizeof line, "%s%s%s", name, s_st.frontApp[0] ? " \xC2\xB7 " : "", s_st.frontApp);
+	text_fit(27, HEAD_LINE3, 0.42f, C_TEXT3, 0, 170, line);
+}
+
+// ---- weather icons, drawn from shapes, centered on (cx, cy), about s px across ----
+
+#define C_CLOUD C2D_Color32(0xC7, 0xC7, 0xCC, 0xFF)
+
+static void sun(float cx, float cy, float s, u32 c) {
+	disc(cx, cy, s * 0.24f, c);
+	for (int i = 0; i < 8; i++) {
+		float a = i * (float)M_PI / 4, ca = cosf(a), sa = sinf(a);
+		C2D_DrawLine(cx + ca * s * 0.34f, cy + sa * s * 0.34f, c, cx + ca * s * 0.47f, cy + sa * s * 0.47f, c, s * 0.07f, 0.5f);
+	}
+}
+
+static void moon(float cx, float cy, float s, u32 c) {
+	disc(cx, cy, s * 0.32f, c);
+	disc(cx + s * 0.16f, cy - s * 0.1f, s * 0.27f, C_BG);
+}
+
+static void cloud(float cx, float cy, float s, u32 c) {
+	rrect(cx - s * 0.46f, cy, s * 0.92f, s * 0.3f, s * 0.15f, c);
+	disc(cx - s * 0.2f, cy + s * 0.04f, s * 0.2f, c);
+	disc(cx + s * 0.08f, cy - s * 0.04f, s * 0.27f, c);
+}
+
+static void weather_icon(const char *symbol, bool day, float cx, float cy, float s) {
+	if (!strcmp(symbol, "clear")) {
+		if (day) sun(cx, cy, s, C_YELLOW);
+		else moon(cx, cy, s, C_CLOUD);
+	} else if (!strcmp(symbol, "partly-cloudy")) {
+		if (day) sun(cx - s * 0.15f, cy - s * 0.15f, s * 0.8f, C_YELLOW);
+		else moon(cx - s * 0.12f, cy - s * 0.15f, s * 0.8f, C_CLOUD);
+		cloud(cx + s * 0.08f, cy + s * 0.08f, s * 0.8f, C_CLOUD);
+	} else if (!strcmp(symbol, "fog")) {
+		for (int i = 0; i < 3; i++)
+			rrect(cx - s * (i == 1 ? 0.38f : 0.46f), cy - s * 0.26f + i * s * 0.22f, s * (i == 1 ? 0.84f : 0.76f), s * 0.1f, s * 0.05f, C_CLOUD);
+	} else if (!strcmp(symbol, "rain") || !strcmp(symbol, "drizzle") || !strcmp(symbol, "snow") || !strcmp(symbol, "storm")) {
+		cloud(cx, cy - s * 0.18f, s, C_CLOUD);
+		float y = cy + s * 0.2f;
+		if (!strcmp(symbol, "storm")) {
+			C2D_DrawTriangle(cx + s * 0.06f, y - s * 0.04f, C_YELLOW, cx - s * 0.14f, y + s * 0.16f, C_YELLOW, cx + s * 0.02f, y + s * 0.16f, C_YELLOW, 0.5f);
+			C2D_DrawTriangle(cx + s * 0.06f, y + s * 0.12f, C_YELLOW, cx - s * 0.1f, y + s * 0.34f, C_YELLOW, cx - s * 0.02f, y + s * 0.12f, C_YELLOW, 0.5f);
+			return;
+		}
+		for (int i = -1; i <= 1; i++) {
+			float x = cx + i * s * 0.22f;
+			if (!strcmp(symbol, "rain")) C2D_DrawLine(x + s * 0.05f, y, C_TEAL, x - s * 0.03f, y + s * 0.2f, C_TEAL, s * 0.06f, 0.5f);
+			else if (!strcmp(symbol, "drizzle")) disc(x, y + s * 0.1f, s * 0.04f, C_TEAL);
+			else disc(x, y + s * 0.1f, s * 0.055f, C_TEXT);
+		}
+	} else {
+		cloud(cx, cy, s, C_CLOUD);
+	}
+}
+
+static void draw_weather(void) {
+	if (!s_st.hasWeather) return;
+	char temp[16], line[96];
+	float right = TOP_W - 14;
+	snprintf(temp, sizeof temp, "%d\xC2\xB0", s_st.temp);
+	text(right, HEAD_BASE, 1.3f, C_TEXT, C2D_AlignRight | C2D_AtBaseline, temp);
+	weather_icon(s_st.symbol, s_st.isDay, right - text_width(temp, 1.3f) - 22, HEAD_BASE - 13, 32);
+	snprintf(line, sizeof line, "%s \xC2\xB7 H %d\xC2\xB0 L %d\xC2\xB0", s_st.condition, s_st.high, s_st.low);
+	text_fit(right, HEAD_LINE2, 0.5f, C_TEXT2, C2D_AlignRight, 175, line);
+	if (s_st.place[0]) text_fit(right, HEAD_LINE3, 0.42f, C_TEXT3, C2D_AlignRight, 170, s_st.place);
 }
 
 static void draw_music_note(float x, float y, float s, u32 c) {
@@ -783,6 +858,7 @@ static void draw_toast(void) {
 static void draw_dashboard(void) {
 	draw_clock();
 	draw_mac_line();
+	draw_weather();
 	draw_now_playing();
 	draw_stats();
 	draw_toast();

@@ -242,6 +242,19 @@ static void apply_status(json_t *root) {
 	bool artChanged = strcmp(art, st.artworkId) != 0;
 	copy(st.artworkId, sizeof st.artworkId, art);
 
+	json_t *wx = json_object_get(root, "weather");
+	st.hasWeather = json_is_object(wx);
+	if (st.hasWeather) {
+		st.temp = json_integer_value(json_object_get(wx, "temp"));
+		st.high = json_integer_value(json_object_get(wx, "high"));
+		st.low = json_integer_value(json_object_get(wx, "low"));
+		copy(st.unit, sizeof st.unit, jstr(wx, "unit"));
+		copy(st.symbol, sizeof st.symbol, jstr(wx, "symbol"));
+		copy(st.condition, sizeof st.condition, jstr(wx, "condition"));
+		st.isDay = json_is_true(json_object_get(wx, "isDay"));
+		copy(st.place, sizeof st.place, jstr(wx, "place"));
+	}
+
 	json_t *stats = json_object_get(root, "stats");
 	st.cpu = json_number_value(json_object_get(stats, "cpu"));
 	st.memUsed = json_number_value(json_object_get(stats, "memoryUsed"));

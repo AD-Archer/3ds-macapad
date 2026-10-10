@@ -1,0 +1,51 @@
+# Builds macapad.3dsx and macapad.cia. Every run uploads both as an artifact;
+# pushing a tag like v1.2.0 also makes a GitHub release with them (and stamps that version into the CIA).
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build 3DSX
+        run: make
+
+      - name: Build CIA
+        run: ./cia/build-cia.sh
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macapad
+          path: |
+            macapad.cia
+            macapad.3dsx
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macapad
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            macapad.cia
+            macapad.3dsx
+          generate_release_notes: true

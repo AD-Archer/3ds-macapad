@@ -24,6 +24,10 @@ sd volume: build
 	cp macapad.3dsx "{{volume}}/3ds/"
 	diskutil eject "{{volume}}"
 
+# Build macapad.cia, to install with FBI (packing tools are x86_64 Linux, so this runs under emulation)
+cia: build
+	docker run --rm --platform linux/amd64 -v "{{justfile_directory()}}":/src -w /src devkitpro/devkitarm ./cia/build-cia.sh
+
 # Remove build output
 clean:
 	./build.sh clean

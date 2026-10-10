@@ -1,8 +1,8 @@
 # Macapad for 3DS
 
-A [Macapad](../../stremadeck) frontend for the Nintendo 3DS.
+A [Macapad](https://github.com/ad-archer/macapad) frontend for the Nintendo 3DS.
 
-- **Top screen:** the time (from the Mac's clock), what's playing on the Mac (any app) with artwork and progress, and
+- **Top screen:** the time (from the Mac's clock), the weather where the Mac is, what's playing on the Mac (any app) with artwork and progress, and
   CPU, memory, battery and disk.
 - **Bottom screen:** a 4×3 pad of keys, in pages. A key can run a Mac action, open an app (with its icon), open a
   website, press a keyboard shortcut or run a Shortcut.
@@ -19,9 +19,20 @@ Uses devkitPro's Docker image, so the only thing to install is Docker Desktop (k
 | `just run` | builds and opens it in the Azahar emulator |
 | `just send 10.0.0.42` | builds and sends it to the 3DS over Wi-Fi: open the Homebrew Launcher and press **Y** first |
 | `just sd /Volumes/NINTENDO` | builds, copies it to `3ds/` on a mounted SD card and ejects it |
+| `just cia` | builds `macapad.cia`, which installs to the HOME Menu with FBI |
 | `just clean` | removes build output |
 
-On the 3DS, open it from the Homebrew Launcher.
+On the 3DS, open it from the Homebrew Launcher, or install the CIA with FBI to get a HOME Menu icon.
+
+### GitHub Actions
+
+`.github/workflows/build.yml` builds both on every push to `main` (download them from the run's **Artifacts**).
+Push a tag like `v1.0.0` to also publish a release with `macapad.cia` and `macapad.3dsx`; the tag becomes the
+CIA's version, so FBI updates an installed copy in place.
+
+`cia/` holds what the CIA needs on top of the 3DSX build: `macapad.rsf` (title id `000400000F731700` and the
+services it may use), the HOME Menu banner (`banner.png`, 256×128, and its sound, `Single-Click.wav`) and `build-cia.sh`, which
+fetches pinned makerom and bannertool builds and packs `macapad.elf` + `macapad.smdh`.
 
 ## Using it
 

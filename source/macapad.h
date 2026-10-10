@@ -64,6 +64,14 @@ typedef struct {
 	int duration, position;  // ms
 	char artworkId[24];
 
+	bool hasWeather;
+	int temp, high, low;
+	char unit[4];        // "F" or "C"
+	char symbol[16];     // clear, partly-cloudy, cloudy, fog, drizzle, rain, snow, storm
+	char condition[32];
+	bool isDay;
+	char place[48];
+
 	double cpu;
 	double memUsed, memTotal;     // bytes
 	int battery;                  // -1 = no battery
