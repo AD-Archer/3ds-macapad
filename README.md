@@ -43,9 +43,10 @@ On the 3DS, open it from the Homebrew Launcher, or install the CIA with FBI to g
 ### GitHub Actions
 
 `.github/workflows/build.yml` builds both on every push and pull request (they're in each run's **Artifacts**).
-Pushes to `main` also replace the **Latest build** release (tag `continuous`). A tag like `v1.0.0` makes a versioned
-release instead, with the tag as the CIA's version. Whichever is newest is GitHub's "latest" release, which is what
-the QR code points at; each release also carries the QR code as `macapad-qr.png`.
+Every push to `main` is also released as the next version, which the workflow tags itself: `v1.0.0`, `v1.0.1`, and so
+on. The CIA's version only has room for 0–15 in the last number, so after `v1.0.15` comes `v1.1.0`; put `[minor]` or
+`[major]` in a commit message to bump those instead. The newest release is GitHub's "latest", which is what the QR
+code points at; each release also carries the QR code as `macapad-qr.png`.
 
 `cia/` holds what the CIA needs on top of the 3DSX build: `macapad.rsf` (title id `000400000F731700` and the
 services it may use), the HOME Menu banner (`banner.png`, 256×128, and its sound, `Single-Click.wav`) and `build-cia.sh`, which

@@ -1,20 +1,56 @@
-# Builds macapad.3dsx and macapad.cia, and publishes them so FBI can install the newest one from a QR code.
-# - every push to main replaces the "Latest build" release (tag `continuous`)
-# - a tag like v1.2.0 makes a versioned release, and stamps that version into the CIA
-# Either way the newest is GitHub's "latest" release, so this URL (and its QR code) always gets the newest CIA:
+# Builds macapad.3dsx and macapad.cia. Every push to main also releases them as the next version
+# (v1.0.0, v1.0.1, ...), tagged by this workflow, so nobody has to make tags. The CIA keeps its version
+# in 6.6.4 bits, so the last number only goes to 15: after v1.0.15 comes v1.1.0. Put [minor] or
+# [major] in a commit message to bump those instead.
+# The newest release is GitHub's "latest", so this URL (and its QR code) always gets the newest CIA:
 #   https://github.com/<owner>/<repo>/releases/latest/download/macapad.cia
-# FBI downloads without signing in, so the repository has to be public for that to work.
 name: Build
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
+# One run at a time per branch, so two quick pushes can't pick the same version.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  version:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MESSAGES: ${{ join(github.event.commits.*.message, ' ') }}
+        run: |
+          last=$(gh api "repos/$GH_REPO/tags" --paginate -q '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -z "$last" ]; then
+            next=1.0.0
+          else
+            IFS=. read -r major minor micro <<< "${last#v}"
+            case "$MESSAGES" in
+              *"[major]"*) major=$((major + 1)); minor=0; micro=0 ;;
+              *"[minor]"*) minor=$((minor + 1)); micro=0 ;;
+              *) micro=$((micro + 1)) ;;
+            esac
+            if [ "$micro" -gt 15 ]; then minor=$((minor + 1)); micro=0; fi
+            if [ "$minor" -gt 63 ]; then major=$((major + 1)); minor=0; fi
+            next=$major.$minor.$micro
+          fi
+          echo "Last release: ${last:-none}, next: v$next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
+    # pull requests skip the version job but still build
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     container: devkitpro/devkitarm
     steps:
@@ -26,7 +62,7 @@ jobs:
       - name: Build CIA
         run: ./cia/build-cia.sh
         env:
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0' }}
+          VERSION: ${{ needs.version.outputs.version || '0.0.0' }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -37,18 +73,14 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # one at a time, so two quick pushes can't both be replacing the release
-    concurrency:
-      group: release
-      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      TAG: v${{ needs.version.outputs.version }}
       CIA_URL: https://github.com/${{ github.repository }}/releases/latest/download/macapad.cia
     steps:
       - uses: actions/download-artifact@v4
@@ -62,26 +94,25 @@ jobs:
 
       - name: Publish
         env:
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMITS: ${{ toJSON(github.event.commits.*.message) }}
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            TAG="$GITHUB_REF_NAME"
-            TITLE="$GITHUB_REF_NAME"
-          else
-            TAG=continuous
-            TITLE="Latest build"
-            gh release delete "$TAG" --yes --cleanup-tag || true
-          fi
+          # the rolling "Latest build" release from before versions; gone after the first run
+          gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
           {
             echo "## Install with FBI"
             echo
-            echo "In FBI, choose **Remote Install → Scan QR Code** and scan this. It always gets the newest build."
+            echo "In FBI, choose **Remote Install → Scan QR Code** and scan this. It always gets the newest version."
             echo
             echo "![QR code](https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/macapad-qr.png)"
             echo
             echo "Or put \`macapad.cia\` on the SD card and install it from FBI's SD menu."
-            echo
-            echo "Built from $GITHUB_SHA: $(printf '%s' "$COMMIT_MESSAGE" | head -1)"
+            changes=$(printf '%s' "$COMMITS" | jq -r '.[]? | split("\n")[0] | "- " + .')
+            if [ -n "$changes" ]; then
+              echo
+              echo "## Changes"
+              echo
+              echo "$changes"
+            fi
           } > notes.md
           gh release create "$TAG" macapad.cia macapad.3dsx macapad-qr.png \
-            --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md --latest
+            --target "$GITHUB_SHA" --title "Macapad $TAG" --notes-file notes.md --latest
