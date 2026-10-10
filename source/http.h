@@ -17,6 +17,8 @@ void http_free(HttpResponse *res);
 
 // "http://192.168.1.5:7317" -> host + port. Port defaults to 7317.
 bool url_split(const char *url, char *host, size_t hostsz, int *port);
+// Why the last connection attempt failed, in a few words (also in sdmc:/3ds/macapad/net.log).
+void http_last_failure(char *out, size_t size);
 
 typedef struct {
 	char host[64];

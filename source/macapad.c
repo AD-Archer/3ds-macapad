@@ -1,6 +1,9 @@
 #include "macapad.h"
 #include "http.h"
 
+#include <3ds.h>
+#include <arpa/inet.h>
+
 #include <jansson.h>
 #include <png.h>
 #include <stdio.h>
@@ -655,7 +658,11 @@ static void pair_thread(void *arg) {
 	json_t *root = sent ? json_loadb(res.body, res.len, 0, NULL) : NULL;
 	if (!sent || res.status != 200 || !root) {
 		const char *msg = jstr(json_object_get(root, "error"), "message");
-		if (!sent) snprintf(pair->error, sizeof pair->error, "Nothing answered at %s:%d.", pair->mac.host, pair->mac.port);
+		if (!sent) {
+			char why[96];
+			http_last_failure(why, sizeof why);
+			snprintf(pair->error, sizeof pair->error, "Nothing answered at %s:%d.\n%s", pair->mac.host, pair->mac.port, why);
+		}
 		else copy(pair->error, sizeof pair->error, *msg ? msg : "The Mac said no.");
 		pair->state = PAIR_FAILED;
 		json_decref(root);
@@ -694,6 +701,51 @@ static void pair_thread(void *arg) {
 		http_free(&res);
 	}
 	pair->running = false;
+}
+
+// 10/8, 172.16/12 or 192.168/16: an address on a home or office network, which a 3DS can reach.
+// (The code can also carry Tailscale addresses, 100.64/10, which it can't.)
+static bool is_lan_ip(struct in_addr a) {
+	u32 ip = ntohl(a.s_addr);
+	return (ip >> 24) == 10 || (ip >> 20) == 0xAC1 || (ip >> 16) == 0xC0A8;
+}
+
+// Why no address in the code answered, as two lines: the 3DS is off Wi-Fi, on a different
+// network from the Mac, the code only has addresses a 3DS can't use, or the Mac isn't answering.
+static void qr_unreachable(Pairing *pair) {
+	struct in_addr me = {0}, mask = {0}, bc = {0};
+	if (SOCU_GetIPInfo(&me, &mask, &bc) != 0 || me.s_addr == 0) me.s_addr = (u32)gethostid();
+	if (me.s_addr == 0) {
+		copy(pair->error, sizeof pair->error, "This 3DS isn't on Wi-Fi.\nJoin the same network as your Mac.");
+		return;
+	}
+	if (mask.s_addr == 0) mask.s_addr = htonl(0xFFFFFF00);
+	char lan[64] = "";
+	int lanPort = 0;
+	bool sameNet = false;
+	for (int i = 0; i < pair->urlCount; i++) {
+		char host[64];
+		int port;
+		struct in_addr a;
+		if (!url_split(pair->urls[i], host, sizeof host, &port) || !inet_aton(host, &a) || !is_lan_ip(a)) continue;
+		if (!lan[0]) {
+			copy(lan, sizeof lan, host);
+			lanPort = port;
+		}
+		if (((a.s_addr ^ me.s_addr) & mask.s_addr) == 0) sameNet = true;
+	}
+	char mine[20];
+	copy(mine, sizeof mine, inet_ntoa(me));
+	if (!lan[0]) {
+		copy(pair->error, sizeof pair->error,
+		     "This code has no local-network address.\nAllow local-network pairing in Macapad.");
+	} else if (!sameNet) {
+		snprintf(pair->error, sizeof pair->error, "Your Mac is on a different network.\nMac %s, this 3DS %s.", lan, mine);
+	} else {
+		char why[96];
+		http_last_failure(why, sizeof why);
+		snprintf(pair->error, sizeof pair->error, "Nothing answered at %s:%d.\n%s", lan, lanPort, why);
+	}
 }
 
 // Pairing with the QR code: POST the key to each address in the link until one answers.
@@ -738,7 +790,7 @@ static void pair_qr_thread(void *arg) {
 		http_free(&res);
 	}
 	if (!reached && !pair->cancel) {
-		copy(pair->error, sizeof pair->error, "Can't reach your Mac. Are both on the same Wi-Fi?");
+		qr_unreachable(pair);
 		pair->state = PAIR_FAILED;
 	}
 	pair->running = false;

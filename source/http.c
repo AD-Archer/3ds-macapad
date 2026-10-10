@@ -5,10 +5,12 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CLIENT_NAME "Nintendo 3DS"
@@ -28,31 +30,88 @@ static int start_connect(struct in_addr addr, int port) {
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons(port);
 	sa.sin_addr = addr;
-	if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0 && errno != EINPROGRESS && errno != EALREADY) {
+	// in progress is the normal answer for a non-blocking connect; some stacks say "would block" instead
+	if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0 && errno != EINPROGRESS && errno != EALREADY &&
+	    errno != EAGAIN && errno != EWOULDBLOCK) {
 		close(fd);
 		return -1;
 	}
 	return fd;
 }
 
+// Whether a non-blocking connect has gone through. A connected socket has a peer; libctru
+// isn't sure which bits the 3DS's poll() uses for errors and hangups, so this doesn't read them.
+// SO_ERROR is the fallback when getpeername() can't say.
 static bool connected(int fd) {
+	struct sockaddr_in peer;
+	socklen_t len = sizeof peer;
+	if (getpeername(fd, (struct sockaddr *)&peer, &len) == 0) return true;
+	if (errno == ENOTCONN) return false;
 	int err = 0;
-	socklen_t len = sizeof err;
+	len = sizeof err;
 	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return true; // can't tell; the send will
 	return err == 0;
 }
 
+// Every connection attempt, appended to the SD card (kept small), for finding out what the
+// 3DS's socket API did on real hardware when nothing answers.
+#define NET_LOG "sdmc:/3ds/macapad/net.log"
+static char s_lastFailure[96];
+static void net_log(const char *host, int port, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(s_lastFailure, sizeof s_lastFailure, fmt, ap);
+	va_end(ap);
+	struct stat st;
+	FILE *f = fopen(NET_LOG, stat(NET_LOG, &st) == 0 && st.st_size > 48 * 1024 ? "w" : "a");
+	if (!f) return;
+	fprintf(f, "%llu %s:%d %s\n", (unsigned long long)osGetTime(), host, port, s_lastFailure);
+	fclose(f);
+}
+
+void http_last_failure(char *out, size_t size) {
+	snprintf(out, size, "%s", s_lastFailure);
+}
+
 static int connect_timeout(const char *host, int port, int timeout_ms) {
 	struct in_addr addr;
-	if (!resolve(host, &addr)) return -1;
-	int fd = start_connect(addr, port);
-	if (fd < 0) return -1;
-	struct pollfd p = {fd, POLLOUT, 0};
-	if (poll(&p, 1, timeout_ms) <= 0 || (p.revents & (POLLERR | POLLHUP)) || !(p.revents & POLLOUT) || !connected(fd)) {
-		close(fd);
+	if (!resolve(host, &addr)) {
+		net_log(host, port, "not an IP address");
 		return -1;
 	}
-	return fd;
+	int fd = start_connect(addr, port);
+	if (fd < 0) {
+		net_log(host, port, "connect failed: errno %d", errno);
+		return -1;
+	}
+	// Any answer from poll() counts; whether it's a connection is for connected() to say.
+	// (Its revents bits are logged in case they turn out to matter.)
+	u64 deadline = osGetTime() + timeout_ms;
+	for (;;) {
+		struct pollfd p = {fd, POLLOUT, 0};
+		int left = (int)(deadline - osGetTime());
+		int r = left > 0 ? poll(&p, 1, left) : 0;
+		if (r < 0) {
+			net_log(host, port, "poll failed: errno %d", errno);
+			break;
+		}
+		if (r == 0) {
+			net_log(host, port, "no answer in %d ms", timeout_ms);
+			break;
+		}
+		if (connected(fd)) return fd;
+		if (p.revents & (POLLERR | POLLNVAL)) {
+			net_log(host, port, "refused: revents 0x%x", p.revents);
+			break;
+		}
+		if (osGetTime() >= deadline) {
+			net_log(host, port, "woke with revents 0x%x but never connected", p.revents);
+			break;
+		}
+		svcSleepThread(20 * 1000000LL);  // woke but not connected yet; ask again shortly
+	}
+	close(fd);
+	return -1;
 }
 
 static bool send_all(int fd, const char *data, size_t len, int timeout_ms) {
@@ -118,6 +177,7 @@ bool http_request(const char *method, const char *host, int port, const char *pa
 	n += snprintf(head + n, sizeof head - n, "\r\n");
 
 	if (!send_all(fd, head, n, timeout_ms) || (body && !send_all(fd, body, strlen(body), timeout_ms))) {
+		net_log(host, port, "connected, but sending %s %s failed: errno %d", method, path, errno);
 		close(fd);
 		return false;
 	}
@@ -143,6 +203,7 @@ bool http_request(const char *method, const char *host, int port, const char *pa
 
 	char *split = strstr(buf, "\r\n\r\n");
 	if (len < 12 || strncmp(buf, "HTTP/", 5) != 0 || !split) {
+		net_log(host, port, "sent %s %s, but the reply made no sense (%u bytes)", method, path, (unsigned)len);
 		free(buf);
 		return false;
 	}
@@ -211,7 +272,7 @@ int net_scan(int port, ScanHit *hits, int max, volatile int *progress, volatile 
 				int k = map[i];
 				done[k] = true;
 				pending--;
-				bool ok = (live[i].revents & POLLOUT) && !(live[i].revents & (POLLERR | POLLHUP)) && connected(fds[k].fd);
+				bool ok = !(live[i].revents & (POLLERR | POLLNVAL)) && connected(fds[k].fd);
 				if (ok && found < max) {
 					struct in_addr a = {htonl(ips[k])};
 					snprintf(hits[found].host, sizeof hits[found].host, "%s", inet_ntoa(a));

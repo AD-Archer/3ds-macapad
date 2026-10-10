@@ -137,7 +137,7 @@ typedef struct {
 	volatile bool running, cancel;
 	volatile PairState state;
 	char code[8];
-	char error[128];
+	char error[160];  // one or two lines (split at a newline)
 
 	// From the QR code the Mac shows: no code to check, the key pairs right away
 	bool viaQr;

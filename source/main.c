@@ -1118,9 +1118,16 @@ static void pair_draw_top(void) {
 	case PAIR_EXPIRED:
 		text(TOP_W / 2, 100, 0.6f, C_ORANGE, C2D_AlignCenter, "That took too long.");
 		break;
-	case PAIR_FAILED:
-		text_fit(TOP_W / 2, 100, 0.55f, C_ORANGE, C2D_AlignCenter, 370, s_pair.error);
+	case PAIR_FAILED: {
+		// up to two lines, split at a newline: what went wrong, then what to do about it
+		char line[160];
+		copy(line, sizeof line, s_pair.error);
+		char *nl = strchr(line, '\n');
+		if (nl) *nl = 0;
+		text_fit(TOP_W / 2, nl ? 86 : 100, 0.52f, C_ORANGE, C2D_AlignCenter, 380, line);
+		if (nl) text_fit(TOP_W / 2, 112, 0.46f, C_TEXT2, C2D_AlignCenter, 380, nl + 1);
 		break;
+	}
 	case PAIR_APPROVED:
 		break;
 	}

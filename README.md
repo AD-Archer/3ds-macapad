@@ -93,7 +93,7 @@ If the Mac's address changes, the 3DS looks for the same Mac on the network agai
 | `source/macapad.c` | config and pads on the SD card, status / press / icon threads, scanning, pairing, catalog |
 | `source/http.c` | a small HTTP/1.1 client on the 3DS socket API, plus the subnet scan |
 | `source/gfx.c` | rounded rects, circles as triangle fans, text that fits, media glyphs, PNG → texture, camera preview |
-| `source/qrscan.c` | the outer camera at 640×480 and a thread that reads QR codes from it, for pairing |
+| `source/qrscan.c` | the outer camera at 640×480: a capture thread and a QR-decoding thread, for pairing |
 | `source/quirc/` | [quirc](https://github.com/dlbeer/quirc) v1.2, the QR decoder (ISC license, see its `LICENSE`) |
 
 Circles are drawn as triangle fans rather than with citro2d's ellipse calls, which Azahar doesn't draw.
