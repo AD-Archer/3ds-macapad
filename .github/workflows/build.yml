@@ -1,5 +1,9 @@
-# Builds macapad.3dsx and macapad.cia. Every run uploads both as an artifact;
-# pushing a tag like v1.2.0 also makes a GitHub release with them (and stamps that version into the CIA).
+# Builds macapad.3dsx and macapad.cia, and publishes them so FBI can install the newest one from a QR code.
+# - every push to main replaces the "Latest build" release (tag `continuous`)
+# - a tag like v1.2.0 makes a versioned release, and stamps that version into the CIA
+# Either way the newest is GitHub's "latest" release, so this URL (and its QR code) always gets the newest CIA:
+#   https://github.com/<owner>/<repo>/releases/latest/download/macapad.cia
+# FBI downloads without signing in, so the repository has to be public for that to work.
 name: Build
 
 on:
@@ -33,19 +37,51 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # one at a time, so two quick pushes can't both be replacing the release
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CIA_URL: https://github.com/${{ github.repository }}/releases/latest/download/macapad.cia
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: macapad
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            macapad.cia
-            macapad.3dsx
-          generate_release_notes: true
+      - name: Make the QR code
+        run: |
+          sudo apt-get install -y -qq qrencode >/dev/null
+          qrencode -s 8 -m 2 -o macapad-qr.png "$CIA_URL"
+
+      - name: Publish
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG="$GITHUB_REF_NAME"
+            TITLE="$GITHUB_REF_NAME"
+          else
+            TAG=continuous
+            TITLE="Latest build"
+            gh release delete "$TAG" --yes --cleanup-tag || true
+          fi
+          {
+            echo "## Install with FBI"
+            echo
+            echo "In FBI, choose **Remote Install → Scan QR Code** and scan this. It always gets the newest build."
+            echo
+            echo "![QR code](https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/macapad-qr.png)"
+            echo
+            echo "Or put \`macapad.cia\` on the SD card and install it from FBI's SD menu."
+            echo
+            echo "Built from $GITHUB_SHA: $(printf '%s' "$COMMIT_MESSAGE" | head -1)"
+          } > notes.md
+          gh release create "$TAG" macapad.cia macapad.3dsx macapad-qr.png \
+            --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md --latest

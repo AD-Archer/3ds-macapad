@@ -9,6 +9,15 @@ A [Macapad](https://github.com/ad-archer/macapad) frontend for the Nintendo 3DS.
 
 Needs Macapad with `GET /api/status` (0.4+), on the same Wi-Fi as the 3DS. A 3DS can't join a tailnet.
 
+## Install with FBI
+
+In FBI on the 3DS, choose **Remote Install → Scan QR Code** and scan this. It always installs the newest build
+(`releases/latest/download/macapad.cia`), so scan it again to update.
+
+<img src="cia/qr.png" width="160" alt="QR code for the newest macapad.cia">
+
+The repository has to be public for this: FBI downloads without signing in to GitHub.
+
 ## Build and run
 
 Uses devkitPro's Docker image, so the only thing to install is Docker Desktop (keep it running). `just` lists the tasks:
@@ -26,9 +35,10 @@ On the 3DS, open it from the Homebrew Launcher, or install the CIA with FBI to g
 
 ### GitHub Actions
 
-`.github/workflows/build.yml` builds both on every push to `main` (download them from the run's **Artifacts**).
-Push a tag like `v1.0.0` to also publish a release with `macapad.cia` and `macapad.3dsx`; the tag becomes the
-CIA's version, so FBI updates an installed copy in place.
+`.github/workflows/build.yml` builds both on every push and pull request (they're in each run's **Artifacts**).
+Pushes to `main` also replace the **Latest build** release (tag `continuous`). A tag like `v1.0.0` makes a versioned
+release instead, with the tag as the CIA's version. Whichever is newest is GitHub's "latest" release, which is what
+the QR code points at; each release also carries the QR code as `macapad-qr.png`.
 
 `cia/` holds what the CIA needs on top of the 3DSX build: `macapad.rsf` (title id `000400000F731700` and the
 services it may use), the HOME Menu banner (`banner.png`, 256×128, and its sound, `Single-Click.wav`) and `build-cia.sh`, which
