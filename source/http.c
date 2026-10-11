@@ -205,6 +205,8 @@ static char *read_response(int fd, size_t *lenOut, size_t *headLen, bool *chunke
 			const char *cn = header(buf, split, "Connection");
 			if (cl) want = atol(cl);
 			else if (te && strncasecmp(te, "chunked", 7) == 0) *chunked = true;
+			// 204 and 304 never carry a body, whether or not the headers say so
+			if (strncmp(buf, "HTTP/", 5) == 0 && (atoi(buf + 9) == 204 || atoi(buf + 9) == 304)) want = 0;
 			if (cn && strncasecmp(cn, "close", 5) == 0) willClose = true;
 		}
 	}

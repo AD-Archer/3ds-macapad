@@ -137,6 +137,8 @@ void pads_load(void) {
 			copy(p->keys[s].ref, sizeof p->keys[s].ref, jstr(k, "ref"));
 			copy(p->keys[s].category, sizeof p->keys[s].category, jstr(k, "category"));
 			copy(p->keys[s].icon, sizeof p->keys[s].icon, jstr(k, "icon"));
+			copy(p->keys[s].glyph, sizeof p->keys[s].glyph, jstr(k, "glyph"));
+			copy(p->keys[s].color, sizeof p->keys[s].color, jstr(k, "color"));
 		}
 	}
 	json_decref(root);
@@ -157,6 +159,8 @@ void pads_save(void) {
 			json_t *obj = json_pack("{s:s,s:s,s:s}", "kind", kinds[k->kind], "label", k->label, "ref", k->ref);
 			if (k->category[0]) json_object_set_new(obj, "category", json_string(k->category));
 			if (k->icon[0]) json_object_set_new(obj, "icon", json_string(k->icon));
+			if (k->glyph[0]) json_object_set_new(obj, "glyph", json_string(k->glyph));
+			if (k->color[0]) json_object_set_new(obj, "color", json_string(k->color));
 			json_array_append_new(keys, obj);
 		}
 		json_array_append_new(pages, json_pack("{s:s,s:o}", "name", p->name, "keys", keys));
@@ -393,12 +397,17 @@ static void rediscover(void) {
 	}
 }
 
+static void icons_mac_back(void);
+
 static void status_thread(void *arg) {
 	int misses = 0;
+	bool wasOnline = false;
 	while (!s_quit) {
 		u64 started = osGetTime();
 		HttpResponse res;
 		if (request(&s_statusConn, "GET", "/api/status", NULL, &res, TIMEOUT_MS) && res.status == 200) {
+			if (!wasOnline) icons_mac_back();  // (before the status says so, so icons asked for then see it)
+			wasOnline = true;
 			json_t *root = json_loadb(res.body, res.len, 0, NULL);
 			if (root) apply_status(root);
 			json_decref(root);
@@ -412,6 +421,7 @@ static void status_thread(void *arg) {
 			misses = 0;
 		} else {
 			mark_offline(res.status == 401);
+			wasOnline = false;
 			if (++misses == 4 && g_config.macId[0]) rediscover();
 		}
 		http_free(&res);
@@ -536,13 +546,17 @@ static void press_thread(void *arg) {
 typedef struct { char id[128]; bool fresh; } IconWant;
 static IconWant s_iconWant[ICON_QUEUE];
 static int s_iconWantCount;
-typedef struct { char id[128]; u8 *px; int w, h; } IconDone;
+typedef struct { char id[128]; u8 *px; int w, h; bool retry; } IconDone;
 static IconDone s_iconDone[ICON_QUEUE];
 static int s_iconDoneCount;
 static HttpConn s_iconConn;
-// Set once the Mac says it has no /api/web/icon (a Macapad from before website icons), so the
-// rest of the websites don't each ask.
-static bool s_noWebIcons;
+// When the Mac last said it has no /api/web/icon (a Macapad from before website icons), so the
+// rest of the websites don't each ask; 0 = it hasn't. Asked again after a while, in case it was updated.
+static u64 s_noWebIconsAt;
+#define NO_WEB_ICONS_FOR_MS (10 * 60 * 1000)
+// The Mac looks a website's icon up on the internet the first time, which can take a few seconds.
+#define ICON_TIMEOUT_MS 5000
+#define WEB_ICON_TIMEOUT_MS 15000
 
 void icon_id(KeyKind kind, const char *ref, char *out, size_t size) {
 	out[0] = 0;
@@ -577,7 +591,7 @@ void icon_request(const char *id, bool fresh) {
 	LightEvent_Signal(&s_iconEvent);
 }
 
-bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h) {
+bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h, bool *retry) {
 	LightLock_Lock(&s_lock);
 	bool got = s_iconDoneCount > 0;
 	if (got) {
@@ -586,19 +600,21 @@ bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h) {
 		*pixels = d->px;
 		*w = d->w;
 		*h = d->h;
+		*retry = d->retry;
 	}
 	LightLock_Unlock(&s_lock);
 	return got;
 }
 
-static void icon_done(const char *id, u8 *px, int w, int h) {
+static void icon_done(const char *id, u8 *px, int w, int h, bool retry) {
 	LightLock_Lock(&s_lock);
 	if (s_iconDoneCount < ICON_QUEUE) {
 		IconDone *d = &s_iconDone[s_iconDoneCount++];
 		copy(d->id, sizeof d->id, id);
-		d->px = px;  // NULL = none; the main thread stops asking until the Mac is back
+		d->px = px;  // NULL = none (retry: the Mac couldn't be reached, so not for sure)
 		d->w = w;
 		d->h = h;
+		d->retry = retry;
 	} else {
 		free(px);
 	}
@@ -636,10 +652,16 @@ static void icon_paths(const char *id, char *file, size_t fsize, char *url, size
 static void *icon_fetch(const char *id, const char *url, const char *file, size_t *len, bool *reached) {
 	bool web = strncmp(id, "web:", 4) == 0;
 	*reached = false;
-	if (web && s_noWebIcons) return NULL;
+	LightLock_Lock(&s_lock);
+	bool noWebIcons = s_noWebIconsAt && osGetTime() - s_noWebIconsAt < NO_WEB_ICONS_FOR_MS;
+	LightLock_Unlock(&s_lock);
+	if (web && noWebIcons) {
+		*reached = true;  // the answer is known: none
+		return NULL;
+	}
 	void *png = NULL;
 	HttpResponse res;
-	if (request(&s_iconConn, "GET", url, NULL, &res, TIMEOUT_MS)) {
+	if (request(&s_iconConn, "GET", url, NULL, &res, web ? WEB_ICON_TIMEOUT_MS : ICON_TIMEOUT_MS)) {
 		*reached = true;
 		if (res.status == 200 && res.len) {
 			ensure_dirs();
@@ -652,11 +674,20 @@ static void *icon_fetch(const char *id, const char *url, const char *file, size_
 			*len = res.len;
 			res.body = NULL;
 		} else if (web && res.status == 404) {
-			s_noWebIcons = true;  // no such route; "no icon for this site" is a 204
+			LightLock_Lock(&s_lock);
+			s_noWebIconsAt = osGetTime();  // no such route; "no icon for this site" is a 204
+			LightLock_Unlock(&s_lock);
 		}
 	}
 	http_free(&res);
 	return png;
+}
+
+// The Mac answered again after being away: it may have been updated, so website icons get asked for again.
+static void icons_mac_back(void) {
+	LightLock_Lock(&s_lock);
+	s_noWebIconsAt = 0;
+	LightLock_Unlock(&s_lock);
 }
 
 static void icon_thread(void *arg) {
@@ -682,19 +713,19 @@ static void icon_thread(void *arg) {
 					old = st.st_mtime > 0 && time(NULL) - st.st_mtime > ICON_FRESH_FOR;
 				}
 			}
-			bool reached = false;
+			bool reached = true;  // (from the SD card: nothing to reach)
 			if (!png) png = icon_fetch(want.id, url, file, &len, &reached);
 			int w = 0, h = 0;
 			u8 *px = png ? png_decode(png, len, &w, &h) : NULL;
 			free(png);
-			icon_done(want.id, px, w, h);
+			icon_done(want.id, px, w, h, !px && !reached);
 
 			// the cached one is showing now; a week old, so ask the Mac for a current one behind it
 			if (old && !s_quit) {
 				png = icon_fetch(want.id, url, file, &len, &reached);
 				px = png ? png_decode(png, len, &w, &h) : NULL;
 				free(png);
-				if (px) icon_done(want.id, px, w, h);
+				if (px) icon_done(want.id, px, w, h, false);
 			}
 		}
 	}
@@ -733,7 +764,7 @@ void macapad_start(void) {
 	s_status.battery = -1;
 	snapshot_load();
 	s_snapshotAt = 0;
-	s_noWebIcons = false;
+	s_noWebIconsAt = 0;
 	s_quit = false;
 	LightEvent_Init(&s_pressEvent, RESET_ONESHOT);
 	LightEvent_Init(&s_iconEvent, RESET_ONESHOT);

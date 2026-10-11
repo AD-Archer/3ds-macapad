@@ -26,6 +26,8 @@ typedef struct {
 	char ref[192];      // action id, bundle id, url, key combo or shortcut name
 	char category[16];  // actions only: media, system, windows, browser, editing, custom
 	char icon[24];      // actions only: the Material Symbols name the Mac suggests, for custom actions
+	char glyph[24];     // the icon picked in "How it looks" (a name from the glyph list); empty = automatic
+	char color[12];     // the color picked there: blue, green, orange, red, purple, yellow, teal, pink or gray; empty = automatic
 } PadKey;
 
 typedef struct {
@@ -210,7 +212,8 @@ void icon_id(KeyKind kind, const char *ref, char *out, size_t size);
 // Queues an icon fetch: from the SD card cache, else from the Mac (which also runs on its own
 // now and then for icons older than a week). fresh skips the cache. Results come back via icon_take.
 void icon_request(const char *id, bool fresh);
-bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h);
+// *pixels is NULL when there's no icon; then *retry says the Mac couldn't be reached, so ask again in a while.
+bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h, bool *retry);
 
 // Decodes a PNG into RGBA8 pixels (malloc'd).
 u8 *png_decode(const void *data, size_t len, int *w, int *h);

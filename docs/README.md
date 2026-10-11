@@ -17,7 +17,8 @@
   with artwork and progress, and the Mac's CPU, memory, battery and disk.
 - **Bottom screen:** a 4×3 pad of keys, in pages. A key can run a Mac action, open an app, open a website, press a
   keyboard shortcut or run a Shortcut. App keys show the app's icon; website keys show the site's icon when the Mac's
-  Macapad can fetch them.
+  Macapad is new enough to fetch them (it looks for the icons the site's page declares, then its favicon). Keys that
+  were on the pad before get theirs too.
 
 The song is polled every 1.5 seconds and is always current. Everything else is allowed to lag a little: the clock
 offset, the weather and the Mac's numbers are kept on the SD card, so the dashboard is filled in from the first frame
@@ -54,6 +55,10 @@ Launcher.
    on the Mac, and works even when the scan can't find the Mac.
 3. **Press keys.** Tap a key to run it. Swipe the pad left or right, or tap **‹** / **›** in its corners, to change
    pages; tap the page's name for the menu. Tap an empty slot, or hold any key, to change it.
+
+   Picking what a key does leads to **How it looks**: the key as it will show, with its name, its icon (automatic,
+   or any of the drawn glyphs) and its color (automatic, or one of nine). The same screen opens from **This key** when
+   you hold a key that's already set; **What it does** on it goes back to the first question.
 
    The search field at the top of "New key" (or the magnifier in the title bar, or **Y**) searches Mac actions, apps
    and Shortcuts at once. Each picker has the same field for searching just itself.
@@ -105,7 +110,9 @@ Each key in `pads.json` is `{kind, label, ref, category?, icon?}`:
 | `shortcut` | a Shortcut's name |
 
 `icon` is the Material Symbols name the Mac suggests for an action. The 3DS draws it when it has a matching glyph;
-built-in actions are drawn by id.
+built-in actions are drawn by id. Two more fields come from **How it looks**, both optional: `glyph`, the icon chosen
+for the key (a name like `play_arrow` or `lock`; it wins over the automatic one), and `color` (`blue`, `green`,
+`orange`, `red`, `purple`, `yellow`, `teal`, `pink` or `gray`).
 
 ## Building
 
