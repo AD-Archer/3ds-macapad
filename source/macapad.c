@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 Config g_config;
 Pads g_pads;
@@ -18,7 +19,16 @@ Pads g_pads;
 #define TIMEOUT_MS 3000
 
 static void copy(char *dst, size_t size, const char *src) {
-	snprintf(dst, size, "%s", src ? src : "");
+	int n = snprintf(dst, size, "%s", src ? src : "");
+	if (n < 0 || (size_t)n < size) return;
+	// cut short: don't leave the start of a multi-byte character at the end (it wouldn't be UTF-8,
+	// and the SD card caches are JSON, which refuses that)
+	size_t end = size - 1, lead = end;
+	while (lead > 0 && (dst[lead - 1] & 0xC0) == 0x80) lead--;
+	if (lead > 0) lead--;
+	unsigned char c = dst[lead];
+	size_t need = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+	if (end - lead < need) dst[lead] = 0;
 }
 
 static const char *jstr(json_t *obj, const char *key) {
@@ -32,6 +42,7 @@ static void ensure_dirs(void) {
 	mkdir("sdmc:/3ds", 0777);
 	mkdir(DATA_DIR, 0777);
 	mkdir(DATA_DIR "/icons", 0777);
+	mkdir(DATA_DIR "/icons/web", 0777);
 }
 
 void config_load(void) {
@@ -225,16 +236,94 @@ static s64 parse_iso(const char *s) {
 	return ((days * 86400) + h * 3600 + mi * 60 + sec) * 1000;
 }
 
+// The weather and stats objects, as the Mac sends them (and as the snapshot keeps them).
+static void apply_weather(Status *st, json_t *wx) {
+	st->temp = json_integer_value(json_object_get(wx, "temp"));
+	st->high = json_integer_value(json_object_get(wx, "high"));
+	st->low = json_integer_value(json_object_get(wx, "low"));
+	copy(st->unit, sizeof st->unit, jstr(wx, "unit"));
+	copy(st->symbol, sizeof st->symbol, jstr(wx, "symbol"));
+	copy(st->condition, sizeof st->condition, jstr(wx, "condition"));
+	st->isDay = json_is_true(json_object_get(wx, "isDay"));
+	copy(st->place, sizeof st->place, jstr(wx, "place"));
+}
+
+static void apply_stats(Status *st, json_t *stats) {
+	st->cpu = json_number_value(json_object_get(stats, "cpu"));
+	st->memUsed = json_number_value(json_object_get(stats, "memoryUsed"));
+	st->memTotal = json_number_value(json_object_get(stats, "memoryTotal"));
+	json_t *bat = json_object_get(stats, "battery");
+	st->battery = json_is_integer(bat) ? (int)json_integer_value(bat) : -1;
+	st->charging = json_is_true(json_object_get(stats, "charging"));
+	st->pluggedIn = json_is_true(json_object_get(stats, "pluggedIn"));
+	st->diskFree = json_number_value(json_object_get(stats, "diskFree"));
+	st->diskTotal = json_number_value(json_object_get(stats, "diskTotal"));
+	st->uptime = json_integer_value(json_object_get(stats, "uptime"));
+	copy(st->thermal, sizeof st->thermal, jstr(stats, "thermal"));
+}
+
+// ---- status snapshot -----------------------------------------------------------
+
+// What the dashboard shows before the Mac answers, and while it's away: the clock's offset, the
+// weather and the Mac's numbers from last time. Not the song: that has to be current.
+#define SNAPSHOT_FILE DATA_DIR "/status.json"
+#define SNAPSHOT_EVERY_MS (10 * 60 * 1000)
+static u64 s_snapshotAt;  // osGetTime() of the last save; 0 = none yet this session
+
+// Before the threads start, so no lock.
+static void snapshot_load(void) {
+	json_t *root = json_load_file(SNAPSHOT_FILE, 0, NULL);
+	if (!root) return;
+	if (strcmp(jstr(root, "macId"), g_config.macId) == 0) {
+		Status *st = &s_status;
+		st->have = true;
+		st->utcOffset = json_integer_value(json_object_get(root, "utcOffset"));
+		st->clockDelta = json_integer_value(json_object_get(root, "clockDelta"));
+		copy(st->macName, sizeof st->macName, jstr(root, "macName"));
+		json_t *wx = json_object_get(root, "weather");
+		st->hasWeather = json_is_object(wx);
+		if (st->hasWeather) apply_weather(st, wx);
+		json_t *stats = json_object_get(root, "stats");
+		if (json_is_object(stats)) apply_stats(st, stats);
+	}
+	json_decref(root);
+}
+
+static void snapshot_save(void) {
+	Status st;
+	status_get(&st);
+	if (!st.live) return;
+	json_t *root = json_pack("{s:s,s:I,s:i,s:i,s:s}", "macId", g_config.macId, "savedAt", (json_int_t)time(NULL),
+		"utcOffset", st.utcOffset, "clockDelta", st.clockDelta, "macName", st.macName);
+	if (!root) return;
+	if (st.hasWeather) {
+		json_object_set_new(root, "weather", json_pack("{s:i,s:i,s:i,s:s,s:s,s:s,s:b,s:s}",
+			"temp", st.temp, "high", st.high, "low", st.low, "unit", st.unit, "symbol", st.symbol,
+			"condition", st.condition, "isDay", st.isDay, "place", st.place));
+	}
+	json_t *stats = json_pack("{s:f,s:f,s:f,s:b,s:b,s:f,s:f,s:i,s:s}",
+		"cpu", st.cpu, "memoryUsed", st.memUsed, "memoryTotal", st.memTotal, "charging", st.charging,
+		"pluggedIn", st.pluggedIn, "diskFree", st.diskFree, "diskTotal", st.diskTotal, "uptime", st.uptime,
+		"thermal", st.thermal);
+	if (st.battery >= 0) json_object_set_new(stats, "battery", json_integer(st.battery));
+	json_object_set_new(root, "stats", stats);
+	ensure_dirs();
+	json_dump_file(root, SNAPSHOT_FILE, JSON_COMPACT);
+	json_decref(root);
+	s_snapshotAt = osGetTime();
+}
+
 static void apply_status(json_t *root) {
 	Status st;
 	LightLock_Lock(&s_lock);
 	st = s_status;
 	LightLock_Unlock(&s_lock);
 
-	st.have = st.online = true;
+	st.have = st.online = st.live = true;
 	st.receivedAt = osGetTime();
 	st.macTime = parse_iso(jstr(root, "time"));
 	st.utcOffset = json_integer_value(json_object_get(root, "utcOffset"));
+	if (st.macTime) st.clockDelta = (int)(st.macTime / 1000 + st.utcOffset - (s64)time(NULL));
 	copy(st.macName, sizeof st.macName, jstr(json_object_get(root, "mac"), "name"));
 	copy(st.frontApp, sizeof st.frontApp, jstr(root, "frontApp"));
 
@@ -255,29 +344,8 @@ static void apply_status(json_t *root) {
 
 	json_t *wx = json_object_get(root, "weather");
 	st.hasWeather = json_is_object(wx);
-	if (st.hasWeather) {
-		st.temp = json_integer_value(json_object_get(wx, "temp"));
-		st.high = json_integer_value(json_object_get(wx, "high"));
-		st.low = json_integer_value(json_object_get(wx, "low"));
-		copy(st.unit, sizeof st.unit, jstr(wx, "unit"));
-		copy(st.symbol, sizeof st.symbol, jstr(wx, "symbol"));
-		copy(st.condition, sizeof st.condition, jstr(wx, "condition"));
-		st.isDay = json_is_true(json_object_get(wx, "isDay"));
-		copy(st.place, sizeof st.place, jstr(wx, "place"));
-	}
-
-	json_t *stats = json_object_get(root, "stats");
-	st.cpu = json_number_value(json_object_get(stats, "cpu"));
-	st.memUsed = json_number_value(json_object_get(stats, "memoryUsed"));
-	st.memTotal = json_number_value(json_object_get(stats, "memoryTotal"));
-	json_t *bat = json_object_get(stats, "battery");
-	st.battery = json_is_integer(bat) ? (int)json_integer_value(bat) : -1;
-	st.charging = json_is_true(json_object_get(stats, "charging"));
-	st.pluggedIn = json_is_true(json_object_get(stats, "pluggedIn"));
-	st.diskFree = json_number_value(json_object_get(stats, "diskFree"));
-	st.diskTotal = json_number_value(json_object_get(stats, "diskTotal"));
-	st.uptime = json_integer_value(json_object_get(stats, "uptime"));
-	copy(st.thermal, sizeof st.thermal, jstr(stats, "thermal"));
+	if (st.hasWeather) apply_weather(&st, wx);
+	apply_stats(&st, json_object_get(root, "stats"));
 
 	json_t *off = json_object_get(root, "off");
 	st.off = json_is_object(off);
@@ -335,6 +403,7 @@ static void status_thread(void *arg) {
 			if (root) apply_status(root);
 			json_decref(root);
 			misses = 0;
+			if (!s_snapshotAt || osGetTime() - s_snapshotAt > SNAPSHOT_EVERY_MS) snapshot_save();
 		} else if (res.status == 404) {
 			// a Macapad from before /api/status: reachable, just can't say what it's doing
 			LightLock_Lock(&s_lock);
@@ -460,34 +529,80 @@ static void press_thread(void *arg) {
 	}
 }
 
-// ---- icons ---------------------------------------------------------------------
+// ---- app and website icons -------------------------------------------------------
 
-#define ICON_QUEUE 64
-static char s_iconWant[ICON_QUEUE][128];
+#define ICON_QUEUE 128
+#define ICON_FRESH_FOR (7 * 24 * 3600)  // seconds; a cached icon older than this is fetched again behind the scenes
+typedef struct { char id[128]; bool fresh; } IconWant;
+static IconWant s_iconWant[ICON_QUEUE];
 static int s_iconWantCount;
 typedef struct { char id[128]; u8 *px; int w, h; } IconDone;
 static IconDone s_iconDone[ICON_QUEUE];
 static int s_iconDoneCount;
+static HttpConn s_iconConn;
+// Set once the Mac says it has no /api/web/icon (a Macapad from before website icons), so the
+// rest of the websites don't each ask.
+static bool s_noWebIcons;
 
-void icon_request(const char *bundleId) {
+void icon_id(KeyKind kind, const char *ref, char *out, size_t size) {
+	out[0] = 0;
+	if (kind == KEY_APP) {
+		copy(out, size, ref);
+	} else if (kind == KEY_WEB) {
+		char host[64];
+		int port;
+		if (!url_split(ref, host, sizeof host, &port)) return;
+		const char *h = strncmp(host, "www.", 4) == 0 ? host + 4 : host;
+		// the host is the file's name on the SD card, so only letters, digits, dots and dashes
+		snprintf(out, size, "web:%s", h);
+		for (char *c = out + 4; *c; c++) {
+			bool ok = (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '.' || *c == '-';
+			if (!ok) *c = '_';
+		}
+	}
+}
+
+void icon_request(const char *id, bool fresh) {
+	if (!id[0]) return;
 	LightLock_Lock(&s_lock);
-	if (s_iconWantCount < ICON_QUEUE) copy(s_iconWant[s_iconWantCount++], 128, bundleId);
+	int i = 0;
+	while (i < s_iconWantCount && strcmp(s_iconWant[i].id, id)) i++;
+	if (i < s_iconWantCount) {
+		s_iconWant[i].fresh |= fresh;  // already waiting
+	} else if (s_iconWantCount < ICON_QUEUE) {
+		copy(s_iconWant[s_iconWantCount].id, sizeof s_iconWant[0].id, id);
+		s_iconWant[s_iconWantCount++].fresh = fresh;
+	}
 	LightLock_Unlock(&s_lock);
 	LightEvent_Signal(&s_iconEvent);
 }
 
-bool icon_take(char *bundleId, size_t size, u8 **pixels, int *w, int *h) {
+bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h) {
 	LightLock_Lock(&s_lock);
 	bool got = s_iconDoneCount > 0;
 	if (got) {
 		IconDone *d = &s_iconDone[--s_iconDoneCount];
-		copy(bundleId, size, d->id);
+		copy(id, size, d->id);
 		*pixels = d->px;
 		*w = d->w;
 		*h = d->h;
 	}
 	LightLock_Unlock(&s_lock);
 	return got;
+}
+
+static void icon_done(const char *id, u8 *px, int w, int h) {
+	LightLock_Lock(&s_lock);
+	if (s_iconDoneCount < ICON_QUEUE) {
+		IconDone *d = &s_iconDone[s_iconDoneCount++];
+		copy(d->id, sizeof d->id, id);
+		d->px = px;  // NULL = none; the main thread stops asking until the Mac is back
+		d->w = w;
+		d->h = h;
+	} else {
+		free(px);
+	}
+	LightLock_Unlock(&s_lock);
 }
 
 static void *read_file(const char *path, size_t *len) {
@@ -505,82 +620,132 @@ static void *read_file(const char *path, size_t *len) {
 	return data;
 }
 
+// Where an icon lives on the SD card, and the path on the Mac that gives it.
+static void icon_paths(const char *id, char *file, size_t fsize, char *url, size_t usize) {
+	if (strncmp(id, "web:", 4) == 0) {
+		snprintf(file, fsize, DATA_DIR "/icons/web/%s.png", id + 4);
+		snprintf(url, usize, "/api/web/icon?host=%s&size=48", id + 4);
+	} else {
+		snprintf(file, fsize, DATA_DIR "/icons/%s.png", id);
+		snprintf(url, usize, "/api/apps/icon?bundleId=%s&size=48", id);
+	}
+}
+
+// Asks the Mac for the icon and keeps it on the SD card. NULL when there's none (or the Mac
+// couldn't be reached: *reached says which).
+static void *icon_fetch(const char *id, const char *url, const char *file, size_t *len, bool *reached) {
+	bool web = strncmp(id, "web:", 4) == 0;
+	*reached = false;
+	if (web && s_noWebIcons) return NULL;
+	void *png = NULL;
+	HttpResponse res;
+	if (request(&s_iconConn, "GET", url, NULL, &res, TIMEOUT_MS)) {
+		*reached = true;
+		if (res.status == 200 && res.len) {
+			ensure_dirs();
+			FILE *f = fopen(file, "wb");
+			if (f) {
+				fwrite(res.body, 1, res.len, f);
+				fclose(f);
+			}
+			png = res.body;
+			*len = res.len;
+			res.body = NULL;
+		} else if (web && res.status == 404) {
+			s_noWebIcons = true;  // no such route; "no icon for this site" is a 204
+		}
+	}
+	http_free(&res);
+	return png;
+}
+
 static void icon_thread(void *arg) {
 	while (!s_quit) {
 		LightEvent_Wait(&s_iconEvent);
 		for (;;) {
-			char id[128];
+			IconWant want = {{0}, false};
 			LightLock_Lock(&s_lock);
 			bool have = s_iconWantCount > 0;
-			if (have) copy(id, sizeof id, s_iconWant[--s_iconWantCount]);
+			if (have) want = s_iconWant[--s_iconWantCount];
 			LightLock_Unlock(&s_lock);
 			if (!have || s_quit) break;
 
-			char path[200];
-			snprintf(path, sizeof path, DATA_DIR "/icons/%s.png", id);
+			char file[200], url[256];
+			icon_paths(want.id, file, sizeof file, url, sizeof url);
 			size_t len = 0;
-			void *png = read_file(path, &len);
-			if (!png) {
-				char url[200];
-				snprintf(url, sizeof url, "/api/apps/icon?bundleId=%s&size=48", id);
-				HttpResponse res;
-				if (request(NULL, "GET", url, NULL, &res, TIMEOUT_MS) && res.status == 200) {
-					ensure_dirs();
-					FILE *f = fopen(path, "wb");
-					if (f) {
-						fwrite(res.body, 1, res.len, f);
-						fclose(f);
-					}
-					png = res.body;
-					len = res.len;
-					res.body = NULL;
+			void *png = NULL;
+			bool old = false;
+			if (!want.fresh) {
+				struct stat st;
+				if (stat(file, &st) == 0) {
+					png = read_file(file, &len);
+					old = st.st_mtime > 0 && time(NULL) - st.st_mtime > ICON_FRESH_FOR;
 				}
-				http_free(&res);
 			}
+			bool reached = false;
+			if (!png) png = icon_fetch(want.id, url, file, &len, &reached);
 			int w = 0, h = 0;
 			u8 *px = png ? png_decode(png, len, &w, &h) : NULL;
 			free(png);
-			LightLock_Lock(&s_lock);
-			if (s_iconDoneCount < ICON_QUEUE) {
-				IconDone *d = &s_iconDone[s_iconDoneCount++];
-				copy(d->id, sizeof d->id, id);
-				d->px = px;  // NULL = failed; the main thread stops asking
-				d->w = w;
-				d->h = h;
-			} else {
-				free(px);
+			icon_done(want.id, px, w, h);
+
+			// the cached one is showing now; a week old, so ask the Mac for a current one behind it
+			if (old && !s_quit) {
+				png = icon_fetch(want.id, url, file, &len, &reached);
+				px = png ? png_decode(png, len, &w, &h) : NULL;
+				free(png);
+				if (px) icon_done(want.id, px, w, h);
 			}
-			LightLock_Unlock(&s_lock);
 		}
 	}
 }
 
 // ---- thread lifetime ---------------------------------------------------------------
 
+static bool s_haveCore1;
+
 static Thread spawn(ThreadFunc fn, void *arg) {
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-	return threadCreate(fn, arg, 32 * 1024, prio + 1, -2, false);
+	// On the system core when the app got a share of it (macapad_init), so parsing answers and
+	// decoding images never take a frame from the screen. Else next to the main thread, where
+	// they run while it waits for the screen.
+	Thread t = s_haveCore1 ? threadCreate(fn, arg, 32 * 1024, prio + 1, 1, false) : NULL;
+	if (!t) t = threadCreate(fn, arg, 32 * 1024, prio + 1, -2, false);
+	return t;
 }
 
 static bool s_started;
+static void catalog_thread(void *arg);
+static Thread s_catalogThread;
+static Handle s_catalogWake;  // signalled to fetch now instead of at the next check
+static HttpConn s_catalogConn;
+static void catalog_forget(void);
 
 void macapad_init(void) {
 	LightLock_Init(&s_lock);
+	s_haveCore1 = R_SUCCEEDED(APT_SetAppCpuTimeLimit(30));
 }
 
 void macapad_start(void) {
 	if (s_started) return;
 	memset(&s_status, 0, sizeof s_status);
 	s_status.battery = -1;
+	snapshot_load();
+	s_snapshotAt = 0;
+	s_noWebIcons = false;
 	s_quit = false;
 	LightEvent_Init(&s_pressEvent, RESET_ONESHOT);
 	LightEvent_Init(&s_iconEvent, RESET_ONESHOT);
+	svcCreateEvent(&s_catalogWake, RESET_ONESHOT);
 	http_conn_init(&s_statusConn);
 	http_conn_init(&s_pressConn);
+	http_conn_init(&s_iconConn);
+	http_conn_init(&s_catalogConn);
 	s_statusThread = spawn(status_thread, NULL);
 	s_pressThread = spawn(press_thread, NULL);
 	s_iconThread = spawn(icon_thread, NULL);
+	s_catalogThread = spawn(catalog_thread, NULL);
 	s_started = true;
 }
 
@@ -589,18 +754,27 @@ void macapad_stop(void) {
 	s_quit = true;
 	LightEvent_Signal(&s_pressEvent);
 	LightEvent_Signal(&s_iconEvent);
-	Thread threads[] = {s_statusThread, s_pressThread, s_iconThread};
-	for (int i = 0; i < 3; i++) {
+	svcSignalEvent(s_catalogWake);
+	Thread threads[] = {s_statusThread, s_pressThread, s_iconThread, s_catalogThread};
+	for (int i = 0; i < 4; i++) {
 		threadJoin(threads[i], U64_MAX);
 		threadFree(threads[i]);
 	}
+	svcCloseHandle(s_catalogWake);
+	s_catalogWake = 0;
+	snapshot_save();  // the threads are done: nothing else writes the status now
 	http_conn_close(&s_statusConn);
 	http_conn_close(&s_pressConn);
+	http_conn_close(&s_iconConn);
+	http_conn_close(&s_catalogConn);
 	json_t *left = take_steps();
 	json_decref(left);
 	free(s_artPixels);
 	s_artPixels = NULL;
 	s_artFresh = false;
+	while (s_iconDoneCount > 0) free(s_iconDone[--s_iconDoneCount].px);
+	s_iconWantCount = 0;
+	catalog_forget();
 	s_started = false;
 }
 
@@ -885,71 +1059,258 @@ void pair_finish(Pairing *pair) {
 	s_pairThread = NULL;
 }
 
-// ---- catalog ---------------------------------------------------------------------
+// ---- catalog cache ---------------------------------------------------------------
 
-static void catalog_thread(void *arg) {
-	Catalog *cat = arg;
-	static const char *paths[] = {"/api/actions", "/api/apps", "/api/shortcuts"};
-	static const char *lists[] = {"actions", "apps", "shortcuts"};
-	HttpResponse res;
-	if (!request(NULL, "GET", paths[cat->kind], NULL, &res, 8000) || res.status != 200) {
-		copy(cat->error, sizeof cat->error, res.status ? "Your Mac said no." : "Can't reach your Mac.");
-		http_free(&res);
-		cat->done = true;
-		cat->running = false;
-		return;
-	}
-	json_t *root = json_loadb(res.body, res.len, 0, NULL);
-	json_t *list = json_object_get(root, lists[cat->kind]);
+// The three lists the key editor picks from, kept in memory and on the SD card. A thread fetches
+// each again when it's older than its interval (asking the Mac for its apps and Shortcuts takes
+// a second or two), or right away when asked.
+typedef struct {
+	CatalogItem *items;
+	int count;
+	u32 generation;         // bumps on every change; 0 = nothing yet
+	s64 savedAt;            // when the Mac answered, seconds since 1970 on this 3DS's clock; 0 = never
+	u64 triedAt;            // osGetTime() of the last fetch, to space out retries
+	bool loaded;
+	bool failed;            // the last fetch didn't work: error says why
+	bool wanted;            // a list or Refresh asked for it
+	bool fetching;
+	char error[96];
+} CatalogCache;
+
+static CatalogCache s_cache[3];
+static const s64 s_catalogEvery[3] = {5 * 60, 30 * 60, 10 * 60};  // seconds: actions, apps, Shortcuts
+static const char *s_catalogPaths[3] = {"/api/actions", "/api/apps", "/api/shortcuts"};
+static const char *s_catalogFiles[3] = {
+	DATA_DIR "/catalog-actions.json", DATA_DIR "/catalog-apps.json", DATA_DIR "/catalog-shortcuts.json"};
+#define CATALOG_RETRY_MS 30000       // after a failed fetch on its own
+#define CATALOG_START_DELAY_MS 3000  // the first status poll and the pad's icons go first
+
+// The items of a list from the Mac (its field names) or from the SD card copy (ours).
+static CatalogItem *catalog_parse(CatalogKind kind, json_t *list, bool fromMac, int *count) {
 	size_t n = json_array_size(list);
-	cat->items = calloc(n ? n : 1, sizeof(CatalogItem));
+	CatalogItem *items = calloc(n ? n : 1, sizeof(CatalogItem));
+	if (!items) return NULL;
+	*count = 0;
 	size_t i;
 	json_t *item;
 	json_array_foreach(list, i, item) {
-		CatalogItem *c = &cat->items[cat->count];
-		switch (cat->kind) {
-		case CATALOG_ACTIONS:
-			copy(c->label, sizeof c->label, jstr(item, "name"));
-			copy(c->sub, sizeof c->sub, jstr(item, "category"));
-			copy(c->value, sizeof c->value, jstr(item, "id"));
+		CatalogItem *c = &items[*count];
+		if (!fromMac) {
+			copy(c->label, sizeof c->label, jstr(item, "label"));
+			copy(c->sub, sizeof c->sub, jstr(item, "sub"));
+			copy(c->value, sizeof c->value, jstr(item, "value"));
 			copy(c->icon, sizeof c->icon, jstr(item, "icon"));
-			break;
-		case CATALOG_APPS:
-			copy(c->label, sizeof c->label, jstr(item, "name"));
-			copy(c->value, sizeof c->value, jstr(item, "bundleId"));
-			break;
-		case CATALOG_SHORTCUTS:
-			copy(c->label, sizeof c->label, json_string_value(item));
-			copy(c->value, sizeof c->value, json_string_value(item));
-			break;
+		} else {
+			switch (kind) {
+			case CATALOG_ACTIONS:
+				copy(c->label, sizeof c->label, jstr(item, "name"));
+				copy(c->sub, sizeof c->sub, jstr(item, "category"));
+				copy(c->value, sizeof c->value, jstr(item, "id"));
+				copy(c->icon, sizeof c->icon, jstr(item, "icon"));
+				break;
+			case CATALOG_APPS:
+				copy(c->label, sizeof c->label, jstr(item, "name"));
+				copy(c->value, sizeof c->value, jstr(item, "bundleId"));
+				break;
+			case CATALOG_SHORTCUTS:
+				copy(c->label, sizeof c->label, json_string_value(item));
+				copy(c->value, sizeof c->value, json_string_value(item));
+				break;
+			}
 		}
-		if (c->value[0]) cat->count++;
+		if (c->value[0]) (*count)++;
+	}
+	return items;
+}
+
+// Takes ownership of items.
+static void catalog_store(CatalogKind kind, CatalogItem *items, int count, s64 savedAt) {
+	LightLock_Lock(&s_lock);
+	CatalogCache *c = &s_cache[kind];
+	free(c->items);
+	c->items = items;
+	c->count = count;
+	c->savedAt = savedAt;
+	c->loaded = true;
+	c->failed = false;
+	c->error[0] = 0;
+	c->generation++;
+	LightLock_Unlock(&s_lock);
+}
+
+static void catalog_load_file(CatalogKind kind) {
+	json_t *root = json_load_file(s_catalogFiles[kind], 0, NULL);
+	if (!root) return;
+	if (strcmp(jstr(root, "macId"), g_config.macId) == 0) {
+		int count = 0;
+		CatalogItem *items = catalog_parse(kind, json_object_get(root, "items"), false, &count);
+		if (items) catalog_store(kind, items, count, json_integer_value(json_object_get(root, "savedAt")));
 	}
 	json_decref(root);
+}
+
+// Written next to the real file first, so a copy half-written when the app closes is never read.
+static void catalog_save_file(CatalogKind kind, const CatalogItem *items, int count, s64 savedAt) {
+	json_t *arr = json_array();
+	for (int i = 0; i < count; i++) {
+		json_t *o = json_pack("{s:s,s:s,s:s,s:s}", "label", items[i].label, "sub", items[i].sub,
+			"value", items[i].value, "icon", items[i].icon);
+		if (o) json_array_append_new(arr, o);
+	}
+	json_t *root = json_pack("{s:s,s:I}", "macId", g_config.macId, "savedAt", (json_int_t)savedAt);
+	if (!root) {
+		json_decref(arr);
+		return;
+	}
+	json_object_set_new(root, "items", arr);
+	ensure_dirs();
+	char tmp[128];
+	snprintf(tmp, sizeof tmp, "%s.tmp", s_catalogFiles[kind]);
+	if (json_dump_file(root, tmp, JSON_COMPACT) == 0) {
+		remove(s_catalogFiles[kind]);
+		rename(tmp, s_catalogFiles[kind]);
+	}
+	json_decref(root);
+}
+
+static void catalog_fetch(CatalogKind kind) {
+	CatalogCache *c = &s_cache[kind];
+	LightLock_Lock(&s_lock);
+	c->fetching = true;
+	c->wanted = false;
+	c->triedAt = osGetTime();
+	LightLock_Unlock(&s_lock);
+
+	static const char *lists[] = {"actions", "apps", "shortcuts"};
+	HttpResponse res;
+	bool sent = request(&s_catalogConn, "GET", s_catalogPaths[kind], NULL, &res, 8000);
+	if (sent && res.status == 200) {
+		json_t *root = json_loadb(res.body, res.len, 0, NULL);
+		int count = 0;
+		CatalogItem *items = root ? catalog_parse(kind, json_object_get(root, lists[kind]), true, &count) : NULL;
+		json_decref(root);
+		if (items) {
+			s64 now = time(NULL);
+			catalog_save_file(kind, items, count, now);
+			catalog_store(kind, items, count, now);
+		}
+	} else {
+		LightLock_Lock(&s_lock);
+		c->failed = true;
+		copy(c->error, sizeof c->error, !sent ? "Can't reach your Mac." : res.status == 401 ? "Your Mac forgot this 3DS." : "Your Mac said no.");
+		LightLock_Unlock(&s_lock);
+	}
 	http_free(&res);
-	cat->ok = true;
-	cat->done = true;
-	cat->running = false;
+	LightLock_Lock(&s_lock);
+	c->fetching = false;
+	LightLock_Unlock(&s_lock);
+}
+
+static void catalog_thread(void *arg) {
+	for (int k = 0; k < 3 && !s_quit; k++) catalog_load_file(k);
+	u64 startedAt = osGetTime();
+	while (!s_quit) {
+		for (int k = 0; k < 3 && !s_quit; k++) {
+			CatalogCache *c = &s_cache[k];
+			LightLock_Lock(&s_lock);
+			bool wanted = c->wanted;
+			bool due = !c->loaded || time(NULL) - c->savedAt > s_catalogEvery[k];
+			bool recentTry = c->triedAt && osGetTime() - c->triedAt < CATALOG_RETRY_MS;
+			bool online = s_status.online;
+			LightLock_Unlock(&s_lock);
+			if (wanted) {
+				catalog_fetch(k);
+				continue;
+			}
+			// On its own: after the start, spaced out after a failure, and not while the Mac is away.
+			if (!due || osGetTime() - startedAt < CATALOG_START_DELAY_MS || recentTry || !online) continue;
+			catalog_fetch(k);
+		}
+		if (s_catalogWake) svcWaitSynchronization(s_catalogWake, 2000 * 1000000LL);
+		else svcSleepThread(2000 * 1000000LL);  // no event to wait on: just look again in a while
+	}
+}
+
+// Drops what's in memory (the files stay): the next start loads them again, for the Mac paired then.
+static void catalog_forget(void) {
+	for (int k = 0; k < 3; k++) {
+		CatalogCache *c = &s_cache[k];
+		free(c->items);
+		c->items = NULL;
+		c->count = 0;
+		c->savedAt = 0;
+		c->triedAt = 0;
+		c->loaded = c->failed = c->wanted = c->fetching = false;
+		c->error[0] = 0;
+		c->generation++;
+	}
+}
+
+bool catalog_sync(Catalog *cat) {
+	bool changed = false;
+	LightLock_Lock(&s_lock);
+	CatalogCache *c = &s_cache[cat->kind];
+	if (c->loaded && c->generation != cat->generation) {
+		CatalogItem *items = malloc((c->count ? c->count : 1) * sizeof(CatalogItem));
+		if (items) {
+			if (c->count) memcpy(items, c->items, c->count * sizeof(CatalogItem));
+			free(cat->items);
+			cat->items = items;
+			cat->count = c->count;
+			cat->generation = c->generation;
+			cat->done = cat->ok = true;
+			cat->error[0] = 0;
+			changed = true;
+		}
+	} else if (!c->loaded && !cat->done && c->failed && !c->fetching && !c->wanted) {
+		cat->done = true;
+		cat->ok = false;
+		copy(cat->error, sizeof cat->error, c->error);
+		changed = true;
+	}
+	LightLock_Unlock(&s_lock);
+	return changed;
 }
 
 void catalog_start(Catalog *cat, CatalogKind kind) {
 	catalog_finish(cat);
 	memset(cat, 0, sizeof *cat);
 	cat->kind = kind;
-	cat->running = true;
-	cat->thread = spawn(catalog_thread, cat);
+	LightLock_Lock(&s_lock);
+	bool loaded = s_cache[kind].loaded;
+	LightLock_Unlock(&s_lock);
+	if (!loaded) catalog_refresh(kind);
+	catalog_sync(cat);
 }
 
 void catalog_finish(Catalog *cat) {
-	if (cat->thread) {
-		threadJoin(cat->thread, U64_MAX);
-		threadFree(cat->thread);
-		cat->thread = NULL;
-	}
 	free(cat->items);
 	cat->items = NULL;
 	cat->count = 0;
-	cat->running = cat->done = false;
+	cat->done = cat->ok = false;
+}
+
+void catalog_refresh(int kind) {
+	LightLock_Lock(&s_lock);
+	for (int k = 0; k < 3; k++) if (kind < 0 || k == kind) s_cache[k].wanted = true;
+	LightLock_Unlock(&s_lock);
+	if (s_catalogWake) svcSignalEvent(s_catalogWake);
+}
+
+void catalog_info(CatalogKind kind, CatalogInfo *info) {
+	LightLock_Lock(&s_lock);
+	CatalogCache *c = &s_cache[kind];
+	info->loaded = c->loaded;
+	info->fetching = c->fetching || c->wanted;
+	info->failed = c->failed;
+	info->ageSec = c->savedAt ? time(NULL) - c->savedAt : -1;
+	copy(info->error, sizeof info->error, c->error);
+	LightLock_Unlock(&s_lock);
+}
+
+void cache_clear(void) {
+	for (int k = 0; k < 3; k++) remove(s_catalogFiles[k]);
+	remove(SNAPSHOT_FILE);
 }
 
 // ---- PNG ---------------------------------------------------------------------------

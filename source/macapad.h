@@ -50,13 +50,17 @@ const char *kind_name(KeyKind kind);
 // ---- live status (filled by the status thread) ------------------------------
 
 typedef struct {
-	bool have;           // at least one answer since connecting
+	bool have;           // something to show: the snapshot saved last time, or an answer from the Mac
+	bool live;           // at least one answer since connecting (the song and stats are current)
 	bool online;         // the last poll worked
 	bool forgotten;      // the Mac rejected our token: pair again
 	bool outdated;       // the Mac's Macapad has no /api/status (older than 0.4)
 	u64 receivedAt;      // osGetTime() when it arrived
 	s64 macTime;         // ms since 1970 on the Mac's clock
 	int utcOffset;       // seconds
+	// Seconds the Mac's local clock is ahead of this 3DS's clock. Saved on the SD card, so the
+	// clock shows the Mac's time from the first frame, and keeps it while the Mac is away.
+	int clockDelta;
 	char macName[64];
 	char frontApp[64];
 
@@ -163,25 +167,50 @@ typedef struct {
 
 typedef enum { CATALOG_ACTIONS, CATALOG_APPS, CATALOG_SHORTCUTS } CatalogKind;
 
+// The catalogs are cached on the SD card and kept fresh by a thread in the background: actions
+// every 5 minutes, Shortcuts every 10, apps every 30 (and whenever asked). A list opens from the
+// cache at once, so there's nothing to wait for after the first time.
 typedef struct {
 	CatalogKind kind;
-	volatile bool running, done;
-	bool ok;
+	bool done;        // items can be shown (from the cache, or once the Mac answered)
+	bool ok;          // done without an error
 	char error[96];
 	int count;
 	CatalogItem *items;
-	Thread thread;
+	u32 generation;   // the version of the cache these came from
 } Catalog;
 
-// Each catalog fetches on its own thread, so several can load at once.
+// Fills cat from the cache when it has that kind (done right away); else asks the Mac.
 void catalog_start(Catalog *cat, CatalogKind kind);
-void catalog_finish(Catalog *cat);  // joins and frees the items; fine on one never started
+// Picks up a newer version from the cache, or the error when a first fetch failed.
+// True when cat changed; call it every frame while the list is open.
+bool catalog_sync(Catalog *cat);
+void catalog_finish(Catalog *cat);  // frees the items; fine on one never started
 
-// ---- app icons ---------------------------------------------------------------
+// Asks the Mac again now, for one kind or all three (kind = -1).
+void catalog_refresh(int kind);
 
-// Queues an app icon fetch (from the SD card cache, else the Mac). Results come back via icon_take.
-void icon_request(const char *bundleId);
-bool icon_take(char *bundleId, size_t size, u8 **pixels, int *w, int *h);
+typedef struct {
+	bool loaded;      // there's something to show
+	bool fetching;    // an answer is on its way
+	bool failed;      // the last fetch didn't work; error says why
+	s64 ageSec;       // seconds since the Mac last answered; -1 = never
+	char error[96];
+} CatalogInfo;
+void catalog_info(CatalogKind kind, CatalogInfo *info);
+
+// Removes the catalogs, the status snapshot and the icons from the SD card (forgetting a Mac).
+void cache_clear(void);
+
+// ---- app and website icons ---------------------------------------------------
+
+// The id an icon is asked for and comes back under: an app's bundle id, or "web:<host>" for a
+// website. Empty when that kind has no icon.
+void icon_id(KeyKind kind, const char *ref, char *out, size_t size);
+// Queues an icon fetch: from the SD card cache, else from the Mac (which also runs on its own
+// now and then for icons older than a week). fresh skips the cache. Results come back via icon_take.
+void icon_request(const char *id, bool fresh);
+bool icon_take(char *id, size_t size, u8 **pixels, int *w, int *h);
 
 // Decodes a PNG into RGBA8 pixels (malloc'd).
 u8 *png_decode(const void *data, size_t len, int *w, int *h);

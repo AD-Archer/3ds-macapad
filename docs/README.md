@@ -16,7 +16,12 @@
 - **Top screen:** the time (from the Mac's clock), the weather where the Mac is, what's playing on the Mac (any app)
   with artwork and progress, and the Mac's CPU, memory, battery and disk.
 - **Bottom screen:** a 4×3 pad of keys, in pages. A key can run a Mac action, open an app, open a website, press a
-  keyboard shortcut or run a Shortcut.
+  keyboard shortcut or run a Shortcut. App keys show the app's icon; website keys show the site's icon when the Mac's
+  Macapad can fetch them.
+
+The song is polled every 1.5 seconds and is always current. Everything else is allowed to lag a little: the clock
+offset, the weather and the Mac's numbers are kept on the SD card, so the dashboard is filled in from the first frame
+and stays filled while the Mac is away (the song card says "Connecting…" until the Mac answers).
 
 ## Requirements
 
@@ -53,6 +58,11 @@ Launcher.
    The search field at the top of "New key" (or the magnifier in the title bar, or **Y**) searches Mac actions, apps
    and Shortcuts at once. Each picker has the same field for searching just itself.
 
+   The pickers open from a cache on the SD card, so there's no waiting after the first time. A thread keeps it fresh
+   in the background: actions every 5 minutes, Shortcuts every 10, apps every 30. The last row of each picker (or
+   **X**) asks the Mac again right away; **Refresh from your Mac** in the START menu does that for all three and
+   fetches the pad's icons again too. Icons are also cached on the SD card and fetched again when a week old.
+
 Taps go to the Mac in order. Any made while one is still on its way are sent together in the next request, so a quick
 run of taps doesn't wait a round trip each. If the Mac's address changes, the 3DS looks for the same Mac on the network
 again after a few failed polls.
@@ -62,12 +72,12 @@ again after a few failed polls.
 | Button | Does |
 |---|---|
 | L / R | previous / next page (or swipe, or tap ‹ ›) |
-| X | play / pause |
+| X | play / pause (in a picker or the menu: refresh from the Mac) |
 | D-pad ← → | previous / next track |
 | D-pad ↑ ↓ | volume |
 | Y | mute |
 | SELECT | edit mode (tap any key to change it) |
-| START | menu: pages (jump to, add, rename, remove), edit keys, 12/24-hour clock, forget this Mac, quit |
+| START | menu: pages (jump to, add, rename, remove), edit keys, 12/24-hour clock, forget this Mac, refresh, quit |
 
 ## Files on the SD card
 
@@ -77,7 +87,12 @@ Everything lives in `sd:/3ds/macapad/`:
 |---|---|
 | `config.json` | the Mac's address, this 3DS's device token, the clock setting |
 | `pads.json` | your pages and keys |
+| `status.json` | the last clock offset, weather and stats, for the dashboard before the Mac answers (per Mac) |
+| `catalog-actions.json`, `catalog-apps.json`, `catalog-shortcuts.json` | the pickers' lists, with when they were fetched (per Mac) |
 | `icons/<bundleId>.png` | cached app icons |
+| `icons/web/<host>.png` | cached website icons |
+
+Forgetting a Mac removes its `status.json` and catalogs; the icons stay.
 
 Each key in `pads.json` is `{kind, label, ref, category?, icon?}`:
 
@@ -130,13 +145,17 @@ and commits it if it ever changes (say, after renaming the repo).
 | File | What |
 |---|---|
 | `source/main.c` | screens: find, pair, dashboard + pad (with page swipes), key editor, grouped lists, menu |
-| `source/macapad.c` | config and pads on the SD card, status / press / icon threads (presses batched, connections kept open), scanning, pairing, catalog |
+| `source/macapad.c` | config and pads on the SD card, status / press / icon / catalog threads (presses batched, connections kept open), the status snapshot, scanning, pairing, the catalog cache |
 | `source/http.c` | a small HTTP/1.1 client on the 3DS socket API, with keep-alive and Content-Length framing, plus the subnet scan |
 | `source/gfx.c` | rounded rects, circles, outlines, text that fits, the icon set, PNG → texture, camera preview |
 | `source/qrscan.c` | the outer camera at 640×480: a capture thread and a QR-decoding thread, for pairing |
 | `source/quirc/` | [quirc](https://github.com/dlbeer/quirc) v1.2, the QR decoder (ISC license, see its `LICENSE`) |
 
 Circles are drawn as triangle fans rather than with citro2d's ellipse calls, which Azahar doesn't draw.
+
+The worker threads run on the 3DS's second core when the system grants a share of it (`APT_SetAppCpuTimeLimit`), so
+parsing answers and decoding images never cost the screen a frame; otherwise they run beside the main thread while it
+waits for the display.
 
 ## Emulator
 

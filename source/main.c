@@ -85,6 +85,7 @@ typedef struct {
 	char empty[96];
 	char filter[48];  // catalogs: only rows whose name contains this
 	int results;      // catalogs: rows that matched
+	int refreshRow;   // the "Refresh from your Mac" row, whose text follows the cache; -1 = none
 } List;
 
 // ---- state -------------------------------------------------------------------
@@ -118,14 +119,16 @@ static touchPosition s_touchStart, s_touchNow;
 static u64 s_touchAt;
 static float s_scrollStart;
 
-// artwork + app icons
+// artwork + app and website icons
 static Picture s_art;
+#define ICON_SLOTS (MAX_PAGES * SLOTS + 8)  // every key on every page, plus a few
 typedef struct {
 	char id[128];
 	int state;  // 1 asked, 2 ready, 3 failed
 	Picture pic;
 } Icon;
-static Icon s_icons[48];
+static Icon s_icons[ICON_SLOTS];
+static bool s_wasOnline;
 
 // ---- helpers -------------------------------------------------------------------
 
@@ -151,17 +154,28 @@ static u32 category_color(const char *cat) {
 	return C_PURPLE;
 }
 
-static Icon *icon_for(const char *bundleId) {
+// The slot for an icon id, or a free one for it (NULL when they're all taken).
+static Icon *icon_slot(const char *id) {
 	Icon *free_slot = NULL;
-	for (int i = 0; i < 48; i++) {
-		if (s_icons[i].state && !strcmp(s_icons[i].id, bundleId)) return &s_icons[i];
+	for (int i = 0; i < ICON_SLOTS; i++) {
+		if (s_icons[i].state && !strcmp(s_icons[i].id, id)) return &s_icons[i];
 		if (!s_icons[i].state && !free_slot) free_slot = &s_icons[i];
 	}
-	if (!free_slot) return NULL;
-	copy(free_slot->id, sizeof free_slot->id, bundleId);
-	free_slot->state = 1;
-	icon_request(bundleId);
+	if (free_slot) copy(free_slot->id, sizeof free_slot->id, id);
 	return free_slot;
+}
+
+// The icon for a key, asked for the first time it's wanted.
+static Icon *icon_for(KeyKind kind, const char *ref) {
+	char id[128];
+	icon_id(kind, ref, id, sizeof id);
+	if (!id[0]) return NULL;
+	Icon *icon = icon_slot(id);
+	if (icon && !icon->state) {
+		icon->state = 1;
+		icon_request(id, false);
+	}
+	return icon;
 }
 
 static void icons_collect(void) {
@@ -169,12 +183,38 @@ static void icons_collect(void) {
 	u8 *px;
 	int w, h;
 	while (icon_take(id, sizeof id, &px, &w, &h)) {
-		for (int i = 0; i < 48; i++) {
-			if (s_icons[i].state != 1 || strcmp(s_icons[i].id, id)) continue;
-			s_icons[i].state = picture_load(&s_icons[i].pic, px, w, h) ? 2 : 3;
+		Icon *icon = icon_slot(id);
+		if (icon) {
+			if (px) {
+				if (icon->state == 2) picture_free(&icon->pic);
+				icon->state = picture_load(&icon->pic, px, w, h) ? 2 : 3;
+			} else if (icon->state != 2) {
+				icon->state = 3;  // none (a newer one that didn't come keeps the old one showing)
+			}
 		}
 		free(px);
 	}
+}
+
+// Asks for every app and website icon on the pad, so they're there before a page is shown. The
+// current page's go last: the icon thread serves the newest request first. Cheap once they're in.
+// fresh fetches them all again from the Mac (the menu's Refresh).
+static void icons_prefetch(bool fresh) {
+	for (int n = g_pads.count - 1; n >= 0; n--) {
+		PadPage *p = &g_pads.pages[(s_page + n) % g_pads.count];
+		for (int slot = 0; slot < SLOTS; slot++) {
+			PadKey *k = &p->keys[slot];
+			if (k->kind != KEY_APP && k->kind != KEY_WEB) continue;
+			Icon *icon = icon_for(k->kind, k->ref);
+			if (icon && fresh && icon->state != 1) icon_request(icon->id, true);
+		}
+	}
+}
+
+// Icons that couldn't be fetched get another go once the Mac is back.
+static void icons_retry(void) {
+	for (int i = 0; i < ICON_SLOTS; i++) if (s_icons[i].state == 3) s_icons[i].state = 0;
+	icons_prefetch(false);
 }
 
 static bool ask_text_opt(const char *hint, const char *initial, SwkbdType type, bool required, char *out, size_t size) {
@@ -267,6 +307,7 @@ static void list_open(ListPurpose purpose, const char *title) {
 	free(s_list.items);
 	memset(&s_list, 0, sizeof s_list);
 	s_list.purpose = purpose;
+	s_list.refreshRow = -1;
 	copy(s_list.title, sizeof s_list.title, title);
 	s_screen = SCR_LIST;
 }
@@ -427,20 +468,82 @@ static void open_kind_menu(void) {
 	list_layout();
 }
 
+static void list_fill_catalog(void);
+
+// Which catalog a list shows, or -1 for all three.
+static int list_catalog(void) {
+	return s_list.purpose == LIST_ACTIONS ? CATALOG_ACTIONS : s_list.purpose == LIST_APPS ? CATALOG_APPS
+	     : s_list.purpose == LIST_SHORTCUTS ? CATALOG_SHORTCUTS : -1;
+}
+
+// The rows once every catalog the list wants is in; until then, "Asking your Mac…".
+static void list_catalogs_ready(void) {
+	bool done = true;
+	for (int k = 0; k < 3; k++) if ((s_wantCats >> k & 1) && !s_cats[k].done) done = false;
+	s_list.loading = !done;
+	if (done) list_fill_catalog();
+}
+
+// Usually from the cache, so the rows are there at once.
 static void open_catalog(ListPurpose purpose, CatalogKind kind, const char *title) {
 	list_open(purpose, title);
-	s_list.loading = true;
 	s_wantCats = 1 << kind;
 	catalog_start(&s_cats[kind], kind);
+	list_catalogs_ready();
 }
 
 // Everything that matches query, from all three catalogs.
 static void open_search(const char *query) {
 	list_open(LIST_SEARCH, "Search");
 	copy(s_list.filter, sizeof s_list.filter, query);
-	s_list.loading = true;
 	s_wantCats = 7;
 	for (int k = 0; k < 3; k++) catalog_start(&s_cats[k], k);
+	list_catalogs_ready();
+}
+
+// "Updated 3 min ago", "Refreshing…", or what went wrong, for one catalog or all three (kind -1).
+static void refresh_detail(int kind, char *out, size_t size) {
+	bool fetching = false, failed = false;
+	s64 age = -1;
+	char error[96] = "";
+	for (int k = 0; k < 3; k++) {
+		if (kind >= 0 && k != kind) continue;
+		CatalogInfo info;
+		catalog_info(k, &info);
+		fetching |= info.fetching;
+		if (info.failed && !failed) {
+			failed = true;
+			copy(error, sizeof error, info.error);
+		}
+		if (info.ageSec > age) age = info.ageSec;  // the oldest of them
+	}
+	if (fetching) copy(out, size, "Refreshing\xE2\x80\xA6");
+	else if (failed) copy(out, size, error);
+	else if (age < 0) copy(out, size, "Not yet");
+	else if (age < 60) copy(out, size, "Updated just now");
+	else if (age < 3600) snprintf(out, size, "Updated %d min ago", (int)(age / 60));
+	else if (age < 86400) snprintf(out, size, "Updated %d h ago", (int)(age / 3600));
+	else snprintf(out, size, "Updated %d days ago", (int)(age / 86400));
+}
+
+// Keeps the Refresh row's text up to date while a list is open.
+static void refresh_row_update(void) {
+	if (s_list.refreshRow < 0 || s_list.refreshRow >= s_list.count) return;
+	Item *it = &s_list.items[s_list.refreshRow];
+	if (s_list.purpose == LIST_MENU) {
+		char detail[32];
+		refresh_detail(-1, detail, sizeof detail);
+		snprintf(it->sub, sizeof it->sub, "Lists and icons \xC2\xB7 %s", detail);
+	} else {
+		refresh_detail(list_catalog(), it->detail, sizeof it->detail);
+	}
+}
+
+// Asks the Mac for this list's catalogs again (and, from the menu, the pad's icons).
+static void refresh_picked(void) {
+	catalog_refresh(list_catalog());
+	if (s_list.purpose == LIST_MENU) icons_prefetch(true);
+	refresh_row_update();
 }
 
 static void open_menu(void) {
@@ -502,6 +605,11 @@ static void menu_build(void) {
 	it->icon = GLYPH_LAPTOP;
 	it->color = C_RED;
 	it->danger = true;
+	it = list_add(ROW_PLAIN, "Refresh from your Mac", "refresh", -2);
+	it->icon = GLYPH_REFRESH;
+	it->color = C_GRAY;
+	s_list.refreshRow = s_list.count - 1;
+	refresh_row_update();
 
 	list_header("");
 	it = list_add(ROW_PLAIN, "Quit Macapad", "quit", 0);
@@ -554,6 +662,7 @@ static void set_key(KeyKind kind, const char *label, const char *ref, const char
 	copy(k->category, sizeof k->category, category);
 	copy(k->icon, sizeof k->icon, icon);
 	pads_save();
+	icons_prefetch(false);
 	s_screen = SCR_MAIN;
 }
 
@@ -576,6 +685,10 @@ static void list_picked(int i) {
 	Item *it = &s_list.items[i];
 	if (it->id == -1 && searchable()) {
 		list_search();
+		return;
+	}
+	if (it->id == -2) {
+		refresh_picked();
 		return;
 	}
 	if (is_catalog() || s_list.purpose == LIST_SEARCH) {
@@ -669,6 +782,7 @@ static void list_picked(int i) {
 			menu_build();
 		} else if (!strcmp(id, "forget")) {
 			macapad_stop();
+			cache_clear();
 			g_config.token[0] = 0;
 			config_save();
 			start_find(NULL);
@@ -773,6 +887,13 @@ static void list_fill_catalog(void) {
 		else copy(s_list.empty, sizeof s_list.empty, s_list.purpose == LIST_SHORTCUTS ? "No shortcuts in the Shortcuts app yet." : "Nothing here.");
 	}
 	s_list.sel = s_list.results ? 2 : 0;  // the first match, past the field and the gap
+
+	list_header("");
+	Item *it = list_add(ROW_PLAIN, "Refresh from your Mac", "refresh", -2);
+	it->icon = GLYPH_REFRESH;
+	it->color = C_GRAY;
+	s_list.refreshRow = s_list.count - 1;
+	refresh_row_update();
 	list_layout();
 }
 
@@ -797,17 +918,26 @@ static void list_search(void) {
 }
 
 static void list_update(u32 down, u32 held, touchPosition touch) {
-	if (s_list.loading) {
-		bool done = true;
-		for (int k = 0; k < 3; k++) if ((s_wantCats >> k & 1) && !s_cats[k].done) done = false;
-		if (done) {
-			s_list.loading = false;
+	if (is_catalog() || s_list.purpose == LIST_SEARCH) {
+		bool changed = false;
+		for (int k = 0; k < 3; k++) if ((s_wantCats >> k & 1) && catalog_sync(&s_cats[k])) changed = true;
+		if (s_list.loading) {
+			list_catalogs_ready();
+		} else if (changed) {
+			// a refresh landed while the list was open: the rows again, where they were
+			float scroll = s_list.scroll;
+			int sel = s_list.sel;
 			list_fill_catalog();
+			s_list.scroll = scroll;
+			s_list.sel = sel;
+			list_layout();
 		}
 	}
+	refresh_row_update();
 
 	if (down & KEY_B) { list_back(); return; }
 	if ((down & KEY_Y) && searchable()) { list_search(); return; }
+	if ((down & KEY_X) && s_list.refreshRow >= 0) { refresh_picked(); return; }
 	if ((down & KEY_START) && s_list.purpose == LIST_MENU) { list_back(); return; }
 	if (down & (KEY_DOWN | KEY_UP | KEY_L | KEY_R) && s_list.count)
 		list_move((down & KEY_DOWN) ? 1 : (down & KEY_UP) ? -1 : (down & KEY_R) ? 5 : -5);
@@ -937,7 +1067,7 @@ static void list_draw(void) {
 		if (!it->last) C2D_DrawRectSolid(x, y + it->h - 1, 0.5f, right - x, 1, C_LINE);
 	}
 	if (s_list.loading) text(BOTTOM_W / 2, 110, 0.5f, C_TEXT2, C2D_AlignCenter, "Asking your Mac\xE2\x80\xA6");
-	else if (s_list.empty[0] && !s_list.results) text_fit(BOTTOM_W / 2, 110, 0.46f, C_TEXT2, C2D_AlignCenter, 300, s_list.empty);
+	else if (s_list.empty[0] && !s_list.results) text_fit(BOTTOM_W / 2, 150, 0.46f, C_TEXT2, C2D_AlignCenter, 300, s_list.empty);  // under the Refresh row
 	bool back = s_list.purpose != LIST_MENU && s_list.purpose != LIST_KIND;
 	header(s_list.title, back ? "\xE2\x80\xB9 Back" : "\xE2\x80\xB9 Done", searchable());
 }
@@ -1076,12 +1206,17 @@ static void key_draw(int page, int slot, float dx, bool pressed) {
 		glyph(action_glyph(k->ref, k->icon), cx, iconY, 20, category_color(k->category), bg);
 		break;
 	case KEY_APP: {
-		Icon *icon = icon_for(k->ref);
+		Icon *icon = icon_for(KEY_APP, k->ref);
 		if (icon && icon->state == 2) picture_draw(&icon->pic, cx - 16, iconY - 16, 32, 32);
 		else glyph(GLYPH_APP, cx, iconY, 26, C_CARD_HI, bg);
 		break;
 	}
-	case KEY_WEB: glyph(GLYPH_GLOBE, cx, iconY, 22, C_TEAL, bg); break;
+	case KEY_WEB: {
+		Icon *icon = icon_for(KEY_WEB, k->ref);
+		if (icon && icon->state == 2) picture_draw(&icon->pic, cx - 16, iconY - 16, 32, 32);
+		else glyph(GLYPH_GLOBE, cx, iconY, 22, C_TEAL, bg);
+		break;
+	}
 	case KEY_KEYS: glyph(GLYPH_KEYS, cx, iconY, 22, C_ORANGE, bg); break;
 	case KEY_SHORTCUT:
 		rrect(cx - 12, iconY - 12, 18, 18, 5, C_PINK);
@@ -1191,9 +1326,10 @@ static void fmt_bytes(char *out, size_t size, double bytes) {
 #define HEAD_LINE3 63
 
 static void draw_clock(void) {
-	time_t now;
-	if (s_st.have && s_st.macTime) now = (s_st.macTime + (s64)(osGetTime() - s_st.receivedAt)) / 1000 + s_st.utcOffset;
-	else now = time(NULL);  // the 3DS clock is already local time
+	// The Mac's local time: this 3DS's clock (local time already) plus the difference measured at
+	// the last answer, which is kept on the SD card, so it's right from the first frame and stays
+	// while the Mac is away.
+	time_t now = time(NULL) + s_st.clockDelta;
 	struct tm *tm = gmtime(&now);
 	char clock[16], date[48];
 	int hour = tm->tm_hour;
@@ -1208,10 +1344,10 @@ static void draw_clock(void) {
 
 static void draw_mac_line(void) {
 	const char *name = s_st.macName[0] ? s_st.macName : g_config.macName;
-	u32 dot = !s_st.have ? C_TEXT3 : s_st.online ? C_GREEN : C_RED;
+	u32 dot = !s_st.live ? C_TEXT3 : s_st.online ? C_GREEN : C_RED;
 	disc(19, HEAD_LINE3 + 7, 3, dot);
 	char line[160];
-	if (s_st.have && !s_st.online) {
+	if (s_st.live && !s_st.online) {
 		text(27, HEAD_LINE3, 0.42f, C_RED, 0, "Can't reach your Mac");
 		return;
 	}
@@ -1310,12 +1446,12 @@ static void draw_play_state(float cx, float cy) {
 
 static void draw_now_playing(void) {
 	rrect(12, CARD_Y, TOP_W - 24, CARD_H, 14, C_CARD);
-	if (s_st.outdated && !s_st.have) {
+	if (s_st.outdated && !s_st.live) {
 		text(TOP_W / 2, CARD_Y + 26, 0.55f, C_ORANGE, C2D_AlignCenter, "Update Macapad on your Mac");
 		text(TOP_W / 2, CARD_Y + 50, 0.45f, C_TEXT2, C2D_AlignCenter, "Keys work, but it can't show the song or stats.");
 		return;
 	}
-	if (!s_st.have) {
+	if (!s_st.live) {  // the song is never shown from the snapshot: it has to be current
 		char msg[96];
 		snprintf(msg, sizeof msg, "Connecting to %s\xE2\x80\xA6", g_config.macName[0] ? g_config.macName : "your Mac");
 		text_fit(TOP_W / 2, CARD_Y + 38, 0.5f, C_TEXT2, C2D_AlignCenter, 340, msg);
@@ -1442,7 +1578,9 @@ static void start_main(void) {
 	s_screen = SCR_MAIN;
 	s_page = 0;
 	memset(&s_st, 0, sizeof s_st);
+	s_wasOnline = false;
 	macapad_start();
+	icons_prefetch(false);
 }
 
 #define FIND_ROW_Y 70
@@ -1745,6 +1883,8 @@ int main(void) {
 		}
 
 		if (s_screen == SCR_MAIN) status_get(&s_st);
+		if (s_st.online && !s_wasOnline) icons_retry();
+		s_wasOnline = s_st.online;
 		u8 *px;
 		int w, h;
 		if (artwork_take(&px, &w, &h)) {
@@ -1819,7 +1959,7 @@ int main(void) {
 	catalogs_finish();
 	macapad_stop();
 	picture_free(&s_art);
-	for (int i = 0; i < 48; i++) picture_free(&s_icons[i].pic);
+	for (int i = 0; i < ICON_SLOTS; i++) picture_free(&s_icons[i].pic);
 	socExit();
 	gfx_exit();
 	C2D_Fini();
