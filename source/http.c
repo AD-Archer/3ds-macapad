@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -99,7 +100,11 @@ static int connect_timeout(const char *host, int port, int timeout_ms) {
 			net_log(host, port, "no answer in %d ms", timeout_ms);
 			break;
 		}
-		if (connected(fd)) return fd;
+		if (connected(fd)) {
+			int one = 1;  // small requests go out at once instead of waiting to be coalesced
+			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+			return fd;
+		}
 		if (p.revents & (POLLERR | POLLNVAL)) {
 			net_log(host, port, "refused: revents 0x%x", p.revents);
 			break;
@@ -161,30 +166,23 @@ static size_t unchunk(char *body, size_t len) {
 	return out - body;
 }
 
-bool http_request(const char *method, const char *host, int port, const char *path,
-                  const char *token, const char *body, HttpResponse *out, int timeout_ms) {
-	memset(out, 0, sizeof *out);
-	int fd = connect_timeout(host, port, timeout_ms);
-	if (fd < 0) return false;
-
-	char head[768];
-	int n = snprintf(head, sizeof head,
-		"%s %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: Macapad3DS/1.0\r\nAccept: */*\r\n"
-		"Connection: close\r\nX-Macapad-Client: " CLIENT_NAME "\r\n",
-		method, path, host, port);
-	if (token && *token) n += snprintf(head + n, sizeof head - n, "Authorization: Bearer %s\r\n", token);
-	if (body) n += snprintf(head + n, sizeof head - n, "Content-Type: application/json\r\nContent-Length: %d\r\n", (int)strlen(body));
-	n += snprintf(head + n, sizeof head - n, "\r\n");
-
-	if (!send_all(fd, head, n, timeout_ms) || (body && !send_all(fd, body, strlen(body), timeout_ms))) {
-		net_log(host, port, "connected, but sending %s %s failed: errno %d", method, path, errno);
-		close(fd);
-		return false;
-	}
-
+// Reads one response into a malloc'd buffer. Stops at the end of the body when the headers say
+// where that is (Content-Length, or the last chunk), else when the Mac hangs up. *headLen is where
+// the body starts (0 if no headers arrived); *reusable says the connection can carry another request.
+static char *read_response(int fd, size_t *lenOut, size_t *headLen, bool *chunked, bool *reusable, int timeout_ms) {
 	size_t cap = 4096, len = 0;
+	long want = -1;  // body bytes promised by Content-Length
+	bool willClose = false, complete = false;
+	*headLen = 0;
+	*chunked = false;
 	char *buf = malloc(cap);
+	if (!buf) return NULL;
+	buf[0] = 0;
 	for (;;) {
+		if (*headLen) {
+			if (want >= 0 && len >= *headLen + (size_t)want) { complete = true; break; }
+			if (*chunked && len >= *headLen + 5 && memcmp(buf + len - 5, "0\r\n\r\n", 5) == 0) { complete = true; break; }
+		}
 		struct pollfd p = {fd, POLLIN, 0};
 		if (poll(&p, 1, timeout_ms) <= 0) break;
 		if (len + 2048 > cap) {
@@ -195,28 +193,126 @@ bool http_request(const char *method, const char *host, int port, const char *pa
 		}
 		ssize_t r = recv(fd, buf + len, cap - len - 1, 0);
 		if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-		if (r <= 0) break;
+		if (r <= 0) { willClose = true; break; }
 		len += r;
+		buf[len] = 0;
+		if (!*headLen) {
+			char *split = strstr(buf, "\r\n\r\n");
+			if (!split) continue;
+			*headLen = split + 4 - buf;
+			const char *cl = header(buf, split, "Content-Length");
+			const char *te = header(buf, split, "Transfer-Encoding");
+			const char *cn = header(buf, split, "Connection");
+			if (cl) want = atol(cl);
+			else if (te && strncasecmp(te, "chunked", 7) == 0) *chunked = true;
+			if (cn && strncasecmp(cn, "close", 5) == 0) willClose = true;
+		}
 	}
-	close(fd);
 	buf[len] = 0;
+	*lenOut = len;
+	*reusable = complete && !willClose;
+	return buf;
+}
 
-	char *split = strstr(buf, "\r\n\r\n");
-	if (len < 12 || strncmp(buf, "HTTP/", 5) != 0 || !split) {
+// The request as one buffer, so head and body leave in a single packet.
+static char *build_request(const char *method, const char *host, int port, const char *path,
+                           const char *token, const char *body, bool keep, size_t *len) {
+	size_t bodyLen = body ? strlen(body) : 0;
+	char *req = malloc(768 + bodyLen + (token ? strlen(token) : 0));
+	if (!req) return NULL;
+	int n = sprintf(req,
+		"%s %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: Macapad3DS/1.0\r\nAccept: */*\r\n"
+		"Connection: %s\r\nX-Macapad-Client: " CLIENT_NAME "\r\n",
+		method, path, host, port, keep ? "keep-alive" : "close");
+	if (token && *token) n += sprintf(req + n, "Authorization: Bearer %s\r\n", token);
+	if (body) n += sprintf(req + n, "Content-Type: application/json\r\nContent-Length: %d\r\n", (int)bodyLen);
+	n += sprintf(req + n, "\r\n");
+	if (body) memcpy(req + n, body, bodyLen);
+	*len = n + bodyLen;
+	return req;
+}
+
+bool http_request_on(HttpConn *conn, const char *method, const char *host, int port, const char *path,
+                     const char *token, const char *body, HttpResponse *out, int timeout_ms) {
+	memset(out, 0, sizeof *out);
+	bool keep = conn != NULL;
+	size_t reqLen;
+	char *req = build_request(method, host, port, path, token, body, keep, &reqLen);
+	if (!req) return false;
+
+	int fd = -1;
+	bool reused = false;
+	if (keep && conn->fd >= 0) {
+		if (conn->port == port && strcmp(conn->host, host) == 0) {
+			fd = conn->fd;
+			reused = true;
+		} else {
+			close(conn->fd);  // the Mac moved; that one's no use now
+		}
+		conn->fd = -1;
+	}
+
+	char *buf = NULL;
+	size_t len = 0, headLen = 0;
+	bool chunked = false, reusable = false;
+	for (;;) {
+		if (fd < 0) {
+			fd = connect_timeout(host, port, timeout_ms);
+			if (fd < 0) { free(req); return false; }
+		}
+		bool sent = send_all(fd, req, reqLen, timeout_ms);
+		if (sent) buf = read_response(fd, &len, &headLen, &chunked, &reusable, timeout_ms);
+		if (sent && buf && len > 0) break;
+		// nothing came back; on a kept connection that usually means the Mac had already closed it
+		close(fd);
+		fd = -1;
+		free(buf);
+		buf = NULL;
+		if (reused) { reused = false; continue; }
+		net_log(host, port, sent ? "sent %s %s, but nothing came back" : "connected, but sending %s %s failed: errno %d", method, path, errno);
+		free(req);
+		return false;
+	}
+	free(req);
+
+	if (keep && reusable) {
+		conn->fd = fd;
+		snprintf(conn->host, sizeof conn->host, "%s", host);
+		conn->port = port;
+	} else {
+		close(fd);
+	}
+
+	if (len < 12 || strncmp(buf, "HTTP/", 5) != 0 || !headLen) {
 		net_log(host, port, "sent %s %s, but the reply made no sense (%u bytes)", method, path, (unsigned)len);
 		free(buf);
+		if (keep) http_conn_close(conn);
 		return false;
 	}
 	out->status = atoi(strchr(buf, ' ') + 1);
-	char *bodyStart = split + 4;
-	size_t bodyLen = len - (bodyStart - buf);
-	const char *te = header(buf, split, "Transfer-Encoding");
-	if (te && strncasecmp(te, "chunked", 7) == 0) bodyLen = unchunk(bodyStart, bodyLen);
+	char *bodyStart = buf + headLen;
+	size_t bodyLen = len - headLen;
+	if (chunked) bodyLen = unchunk(bodyStart, bodyLen);
 	memmove(buf, bodyStart, bodyLen);
 	buf[bodyLen] = 0;
 	out->body = buf;
 	out->len = bodyLen;
 	return true;
+}
+
+bool http_request(const char *method, const char *host, int port, const char *path,
+                  const char *token, const char *body, HttpResponse *out, int timeout_ms) {
+	return http_request_on(NULL, method, host, port, path, token, body, out, timeout_ms);
+}
+
+void http_conn_init(HttpConn *conn) {
+	memset(conn, 0, sizeof *conn);
+	conn->fd = -1;
+}
+
+void http_conn_close(HttpConn *conn) {
+	if (conn->fd >= 0) close(conn->fd);
+	conn->fd = -1;
 }
 
 void http_free(HttpResponse *res) {

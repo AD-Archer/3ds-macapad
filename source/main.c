@@ -3,6 +3,7 @@
 #include <3ds.h>
 #include <arpa/inet.h>
 #include <citro2d.h>
+#include <ctype.h>
 #include <malloc.h>
 #include <math.h>
 #include <stdio.h>
@@ -17,8 +18,21 @@
 
 #define SOC_BUFFERSIZE 0x100000
 #define LONG_PRESS_MS 500
-#define ROW_H 36
+
+// lists: inset cards of rows under a title bar
 #define LIST_TOP 34
+#define ROW_H 34
+#define ROW2_H 42       // a row with a second line
+#define HEAD_H 26       // a section title above a card
+#define BREAK_H 8       // a gap between cards
+#define CARD_X 8
+#define CARD_W (BOTTOM_W - 2 * CARD_X)
+#define TILE 24         // the icon square at the left of a row
+
+// swiping between pages
+#define SWIPE_COMMIT 70  // px: farther than this and the page changes
+#define FLICK_PX 22      // or a quick flick of at least this far
+#define FLICK_MS 260
 
 typedef enum { SCR_FIND, SCR_QR, SCR_PAIR, SCR_MAIN, SCR_LIST, SCR_KEYS } Screen;
 
@@ -30,14 +44,34 @@ typedef enum {
 	LIST_SHORTCUTS,
 	LIST_KEYNAME,    // the key in a keyboard shortcut
 	LIST_MENU,       // START menu
+	LIST_SEARCH,     // actions, apps and Shortcuts that match what was typed
 } ListPurpose;
 
+typedef enum {
+	ROW_PLAIN,
+	ROW_HEADER,   // a section title (not pickable); an empty one is just a gap
+	ROW_TOGGLE,   // a switch at the right
+	ROW_CHEVRON,  // leads somewhere: "›" at the right, with detail text before it
+	ROW_CHECK,    // one of several: a check at the right when it's the one
+	ROW_SEARCH,   // the search field: a pill with what was typed, or a prompt
+} RowStyle;
+
 typedef struct {
+	RowStyle style;
 	char label[64];
-	char sub[48];
-	char value[192];
-	u32 color;
+	char sub[48];       // a second line under the label
+	char detail[32];    // small text at the right
+	char value[192];    // what picking it means
 	int id;
+	Glyph icon;         // GLYPH_NONE: no tile (unless tag is set)
+	char tag[4];        // short text on the tile instead of a glyph: "1", "Aa"
+	u32 color;          // the tile
+	bool on;            // the switch is on / the check shows
+	bool danger;        // red label
+	char category[16];  // actions: for the key
+	char iconName[24];  // actions: for the key
+	float y, h;         // from list_layout
+	bool first, last;   // ends of its card
 } Item;
 
 typedef struct {
@@ -46,9 +80,11 @@ typedef struct {
 	Item *items;
 	int count;
 	int sel;
-	float scroll;
+	float scroll, height;
 	bool loading;
 	char empty[96];
+	char filter[48];  // catalogs: only rows whose name contains this
+	int results;      // catalogs: rows that matched
 } List;
 
 // ---- state -------------------------------------------------------------------
@@ -56,11 +92,15 @@ typedef struct {
 static Screen s_screen;
 static Scan s_scan;
 static Pairing s_pair;
-static Catalog s_catalog;
+static Catalog s_cats[3];  // one per CatalogKind; the ones a list asked for stay until it closes
+static int s_wantCats;      // bit per CatalogKind
 static List s_list;
 static Status s_st;
 
 static int s_page;
+static float s_slide;      // px the current page is shifted while swiping or sliding into place
+static bool s_swiping;     // this touch is a sideways drag
+static bool s_swipeAxis;   // this touch has picked an axis
 static bool s_editing;
 static int s_editSlot = -1;
 static int s_flashSlot = -1;
@@ -94,6 +134,13 @@ static bool in(touchPosition t, float x, float y, float w, float h) {
 }
 
 static void copy(char *dst, size_t size, const char *src) { snprintf(dst, size, "%s", src ? src : ""); }
+
+// ASCII upper case, for section titles.
+static void upper(char *dst, size_t size, const char *src) {
+	size_t i = 0;
+	for (; src[i] && i + 1 < size; i++) dst[i] = (char)toupper((unsigned char)src[i]);
+	dst[i] = 0;
+}
 
 static u32 category_color(const char *cat) {
 	if (!strcmp(cat, "media")) return C_GREEN;
@@ -130,17 +177,89 @@ static void icons_collect(void) {
 	}
 }
 
-static bool ask_text(const char *hint, const char *initial, SwkbdType type, char *out, size_t size) {
+static bool ask_text_opt(const char *hint, const char *initial, SwkbdType type, bool required, char *out, size_t size) {
 	SwkbdState kb;
 	swkbdInit(&kb, type, 2, size - 1);
 	swkbdSetHintText(&kb, hint);
 	if (initial) swkbdSetInitialText(&kb, initial);
-	swkbdSetValidation(&kb, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
+	if (required) swkbdSetValidation(&kb, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
 	if (type == SWKBD_TYPE_NUMPAD) swkbdSetNumpadKeys(&kb, '.', ':');
 	return swkbdInputText(&kb, out, size) == SWKBD_BUTTON_CONFIRM;
 }
 
+static bool ask_text(const char *hint, const char *initial, SwkbdType type, char *out, size_t size) {
+	return ask_text_opt(hint, initial, type, true, out, size);
+}
+
+// Whether hay contains needle, ignoring case.
+static bool contains_ci(const char *hay, const char *needle) {
+	size_t n = strlen(needle);
+	if (!n) return true;
+	for (; *hay; hay++) {
+		size_t i = 0;
+		while (i < n && hay[i] && tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i])) i++;
+		if (i == n) return true;
+	}
+	return false;
+}
+
 static PadKey *edit_key(void) { return &g_pads.pages[s_page].keys[s_editSlot]; }
+
+// ---- which icon an action gets -----------------------------------------------------
+
+// The built-in actions, by id.
+static const struct { const char *id; Glyph g; } s_actionGlyphs[] = {
+	{"next-track", GLYPH_NEXT}, {"previous-track", GLYPH_PREV},
+	{"volume-up", GLYPH_VOL_UP}, {"volume-down", GLYPH_VOL_DOWN}, {"mute", GLYPH_MUTE},
+	{"emoji", GLYPH_SMILE}, {"spotlight", GLYPH_SEARCH}, {"screenshot-ui", GLYPH_CAMERA},
+	{"screenshot-area", GLYPH_CROP}, {"screenshot-screen", GLYPH_MONITOR}, {"mission-control", GLYPH_GRID},
+	{"app-windows", GLYPH_WINDOWS}, {"lock-screen", GLYPH_LOCK},
+	{"minimize", GLYPH_MINIMIZE}, {"fullscreen", GLYPH_EXPAND}, {"close-window", GLYPH_CLOSE},
+	{"next-window", GLYPH_WINDOWS}, {"hide-app", GLYPH_MINUS_CIRCLE}, {"quit-app", GLYPH_POWER},
+	{"reload", GLYPH_REFRESH}, {"hard-reload", GLYPH_REFRESH}, {"new-tab", GLYPH_TAB}, {"close-tab", GLYPH_CLOSE},
+	{"reopen-tab", GLYPH_UNDO}, {"next-tab", GLYPH_ARROW_RIGHT}, {"previous-tab", GLYPH_ARROW_LEFT},
+	{"address-bar", GLYPH_ADDRESS},
+	{"copy", GLYPH_COPY}, {"paste", GLYPH_PASTE}, {"cut", GLYPH_CUT}, {"undo", GLYPH_UNDO}, {"redo", GLYPH_REDO},
+	{"select-all", GLYPH_SELECT_ALL}, {"find", GLYPH_SEARCH}, {"save", GLYPH_SAVE},
+};
+
+// Material Symbols names the Mac suggests, for actions made there.
+static const struct { const char *name; Glyph g; } s_iconGlyphs[] = {
+	{"play_pause", GLYPH_PLAYPAUSE}, {"play_arrow", GLYPH_PLAY}, {"pause", GLYPH_PAUSE},
+	{"skip_next", GLYPH_NEXT}, {"skip_previous", GLYPH_PREV},
+	{"volume_up", GLYPH_VOL_UP}, {"volume_down", GLYPH_VOL_DOWN}, {"volume_off", GLYPH_MUTE}, {"volume_mute", GLYPH_MUTE},
+	{"mood", GLYPH_SMILE}, {"sentiment_satisfied", GLYPH_SMILE}, {"search", GLYPH_SEARCH},
+	{"photo_camera", GLYPH_CAMERA}, {"camera", GLYPH_CAMERA}, {"screenshot", GLYPH_CROP}, {"crop", GLYPH_CROP},
+	{"screenshot_monitor", GLYPH_MONITOR}, {"desktop_mac", GLYPH_MONITOR}, {"monitor", GLYPH_MONITOR},
+	{"grid_view", GLYPH_GRID}, {"apps", GLYPH_GRID}, {"dashboard", GLYPH_GRID}, {"web_asset", GLYPH_WINDOWS},
+	{"lock", GLYPH_LOCK}, {"lock_open", GLYPH_LOCK},
+	{"arrow_downward", GLYPH_MINIMIZE}, {"open_in_new", GLYPH_EXPAND}, {"fullscreen", GLYPH_EXPAND},
+	{"close", GLYPH_CLOSE}, {"cancel", GLYPH_CLOSE}, {"refresh", GLYPH_REFRESH}, {"sync", GLYPH_REFRESH},
+	{"remove_circle_outline", GLYPH_MINUS_CIRCLE}, {"remove_circle", GLYPH_MINUS_CIRCLE}, {"visibility_off", GLYPH_MINUS_CIRCLE},
+	{"power_settings_new", GLYPH_POWER}, {"power", GLYPH_POWER}, {"logout", GLYPH_POWER},
+	{"tab", GLYPH_TAB}, {"add_box", GLYPH_TAB}, {"folder", GLYPH_TAB},
+	{"undo", GLYPH_UNDO}, {"redo", GLYPH_REDO}, {"arrow_forward", GLYPH_ARROW_RIGHT}, {"arrow_back", GLYPH_ARROW_LEFT},
+	{"link", GLYPH_ADDRESS}, {"language", GLYPH_GLOBE}, {"public", GLYPH_GLOBE},
+	{"content_copy", GLYPH_COPY}, {"content_paste", GLYPH_PASTE}, {"content_cut", GLYPH_CUT},
+	{"select_all", GLYPH_SELECT_ALL}, {"save_alt", GLYPH_SAVE}, {"save", GLYPH_SAVE},
+	{"keyboard", GLYPH_KEYS}, {"schedule", GLYPH_CLOCK}, {"laptop_mac", GLYPH_LAPTOP}, {"edit", GLYPH_PENCIL},
+	{"delete", GLYPH_TRASH}, {"add", GLYPH_PLUS}, {"check", GLYPH_CHECK}, {"bolt", GLYPH_BOLT}, {"flash_on", GLYPH_BOLT},
+	{"terminal", GLYPH_KEYS}, {"shortcut", GLYPH_SHORTCUT},
+};
+
+static Glyph glyph_for_icon(const char *name) {
+	for (size_t i = 0; i < sizeof s_iconGlyphs / sizeof *s_iconGlyphs; i++)
+		if (!strcmp(name, s_iconGlyphs[i].name)) return s_iconGlyphs[i].g;
+	return GLYPH_NONE;
+}
+
+static Glyph action_glyph(const char *id, const char *icon) {
+	if (!strcmp(id, "play-pause")) return s_st.hasTrack && s_st.playing ? GLYPH_PAUSE : GLYPH_PLAY;
+	for (size_t i = 0; i < sizeof s_actionGlyphs / sizeof *s_actionGlyphs; i++)
+		if (!strcmp(id, s_actionGlyphs[i].id)) return s_actionGlyphs[i].g;
+	Glyph g = icon ? glyph_for_icon(icon) : GLYPH_NONE;
+	return g != GLYPH_NONE ? g : GLYPH_BOLT;
+}
 
 // ---- lists -----------------------------------------------------------------------
 
@@ -152,20 +271,30 @@ static void list_open(ListPurpose purpose, const char *title) {
 	s_screen = SCR_LIST;
 }
 
-static Item *list_add(const char *label, const char *sub, const char *value, u32 color, int id) {
+static Item *list_add(RowStyle style, const char *label, const char *value, int id) {
 	s_list.items = realloc(s_list.items, (s_list.count + 1) * sizeof(Item));
 	Item *it = &s_list.items[s_list.count++];
 	memset(it, 0, sizeof *it);
+	it->style = style;
 	copy(it->label, sizeof it->label, label);
-	copy(it->sub, sizeof it->sub, sub);
 	copy(it->value, sizeof it->value, value);
-	it->color = color;
 	it->id = id;
 	return it;
 }
 
+// A section title, in capitals. An empty one is a gap between cards.
+static void list_header(const char *title) {
+	char up[64];
+	upper(up, sizeof up, title);
+	list_add(ROW_HEADER, up, "", 0);
+}
+
+static bool pickable(int i) { return i >= 0 && i < s_list.count && s_list.items[i].style != ROW_HEADER; }
+
+static float list_view(void) { return SCREEN_H - LIST_TOP; }
+
 static float list_max_scroll(void) {
-	float h = s_list.count * ROW_H - (SCREEN_H - LIST_TOP);
+	float h = s_list.height - list_view();
 	return h > 0 ? h : 0;
 }
 
@@ -174,44 +303,212 @@ static void list_clamp(void) {
 	if (s_list.scroll > list_max_scroll()) s_list.scroll = list_max_scroll();
 }
 
-static void list_show_sel(void) {
-	float top = s_list.sel * ROW_H, bottom = top + ROW_H, view = SCREEN_H - LIST_TOP;
-	if (top < s_list.scroll) s_list.scroll = top;
-	if (bottom > s_list.scroll + view) s_list.scroll = bottom - view;
+// Works out where every row sits, and settles the selection on a row that can be picked.
+static void list_layout(void) {
+	float y = 6;
+	bool inCard = false;
+	for (int i = 0; i < s_list.count; i++) {
+		Item *it = &s_list.items[i];
+		if (it->style == ROW_HEADER) {
+			it->y = y;
+			it->h = it->label[0] ? HEAD_H + (inCard ? 4 : 0) : BREAK_H;
+			y += it->h;
+			inCard = false;
+			continue;
+		}
+		if (it->style == ROW_SEARCH) {  // a pill of its own
+			it->first = it->last = true;
+			it->y = y;
+			it->h = ROW_H;
+			y += it->h;
+			inCard = false;
+			continue;
+		}
+		it->first = !inCard;
+		it->last = true;
+		if (inCard) s_list.items[i - 1].last = false;
+		it->y = y;
+		it->h = it->sub[0] ? ROW2_H : ROW_H;
+		y += it->h;
+		inCard = true;
+	}
+	s_list.height = y + 8;
 	list_clamp();
+	if (!pickable(s_list.sel)) {
+		// the next row that can be picked, else the first
+		int i = s_list.sel < 0 ? 0 : s_list.sel;
+		while (i < s_list.count && !pickable(i)) i++;
+		if (i >= s_list.count) for (i = 0; i < s_list.count && !pickable(i); i++) {}
+		s_list.sel = i;
+	}
+}
+
+static void list_show_sel(void) {
+	if (!pickable(s_list.sel)) return;
+	Item *it = &s_list.items[s_list.sel];
+	float top = it->y - (it->first ? HEAD_H : 0), bottom = it->y + it->h + 6;
+	if (top < s_list.scroll) s_list.scroll = top;
+	if (bottom > s_list.scroll + list_view()) s_list.scroll = bottom - list_view();
+	list_clamp();
+}
+
+// Moves the selection by step rows that can be picked.
+static void list_move(int step) {
+	int dir = step < 0 ? -1 : 1, i = s_list.sel;
+	for (int n = abs(step); n > 0; n--) {
+		int j = i + dir;
+		while (j >= 0 && j < s_list.count && !pickable(j)) j += dir;
+		if (j < 0 || j >= s_list.count) break;
+		i = j;
+	}
+	s_list.sel = i;
+	list_show_sel();
+}
+
+static void menu_build(void);
+static void list_search(void);
+
+static bool is_catalog(void) {
+	return s_list.purpose == LIST_ACTIONS || s_list.purpose == LIST_APPS || s_list.purpose == LIST_SHORTCUTS;
+}
+
+// Lists with a search field and the magnifier in the title bar.
+static bool searchable(void) { return is_catalog() || s_list.purpose == LIST_KIND || s_list.purpose == LIST_SEARCH; }
+
+static void catalogs_finish(void) {
+	for (int k = 0; k < 3; k++) catalog_finish(&s_cats[k]);
+	s_wantCats = 0;
+}
+
+// The field at the top of a list. Shows the query when there is one, else what it searches.
+static void add_search_row(const char *prompt) {
+	Item *it = list_add(ROW_SEARCH, s_list.filter[0] ? s_list.filter : prompt, "search", -1);
+	it->on = s_list.filter[0] != 0;
+	list_header("");
 }
 
 // The editor's first question.
 static void open_kind_menu(void) {
 	PadKey *k = edit_key();
 	list_open(LIST_KIND, k->kind ? k->label : "New key");
-	list_add("Mac action", "Media, windows, browser, editing", "", C_GREEN, KEY_ACTION);
-	list_add("Open an app", "Any app on your Mac", "", C_BLUE, KEY_APP);
-	list_add("Open a website", "In your Mac's browser", "", C_TEAL, KEY_WEB);
-	list_add("Keyboard shortcut", "Like Cmd + Shift + T", "", C_ORANGE, KEY_KEYS);
-	list_add("Run a Shortcut", "From the Shortcuts app", "", C_PURPLE, KEY_SHORTCUT);
+	add_search_row("Search actions, apps, Shortcuts");
+	Item *it;
+	it = list_add(ROW_CHEVRON, "Mac action", "", KEY_ACTION);
+	copy(it->sub, sizeof it->sub, "Media, windows, browser, editing");
+	it->icon = GLYPH_BOLT;
+	it->color = C_GREEN;
+	it = list_add(ROW_CHEVRON, "Open an app", "", KEY_APP);
+	copy(it->sub, sizeof it->sub, "Any app on your Mac");
+	it->icon = GLYPH_APP;
+	it->color = C_BLUE;
+	it = list_add(ROW_CHEVRON, "Open a website", "", KEY_WEB);
+	copy(it->sub, sizeof it->sub, "In your Mac's browser");
+	it->icon = GLYPH_GLOBE;
+	it->color = C_TEAL;
+	it = list_add(ROW_CHEVRON, "Keyboard shortcut", "", KEY_KEYS);
+	copy(it->sub, sizeof it->sub, "Like Cmd + Shift + T");
+	it->icon = GLYPH_KEYS;
+	it->color = C_ORANGE;
+	it = list_add(ROW_CHEVRON, "Run a Shortcut", "", KEY_SHORTCUT);
+	copy(it->sub, sizeof it->sub, "From the Shortcuts app");
+	it->icon = GLYPH_SHORTCUT;
+	it->color = C_PURPLE;
 	if (k->kind) {
-		list_add("Rename this key", k->label, "", C_TEXT2, 100);
-		list_add("Remove this key", "", "", C_RED, 101);
+		list_header("This key");
+		it = list_add(ROW_CHEVRON, "Rename", "", 100);
+		copy(it->detail, sizeof it->detail, k->label);
+		it->icon = GLYPH_PENCIL;
+		it->color = C_GRAY;
+		it = list_add(ROW_PLAIN, "Remove this key", "", 101);
+		it->icon = GLYPH_TRASH;
+		it->color = C_RED;
+		it->danger = true;
 	}
+	list_layout();
 }
 
 static void open_catalog(ListPurpose purpose, CatalogKind kind, const char *title) {
 	list_open(purpose, title);
 	s_list.loading = true;
-	catalog_start(&s_catalog, kind);
+	s_wantCats = 1 << kind;
+	catalog_start(&s_cats[kind], kind);
 }
 
+// Everything that matches query, from all three catalogs.
+static void open_search(const char *query) {
+	list_open(LIST_SEARCH, "Search");
+	copy(s_list.filter, sizeof s_list.filter, query);
+	s_list.loading = true;
+	s_wantCats = 7;
+	for (int k = 0; k < 3; k++) catalog_start(&s_cats[k], k);
+}
 
 static void open_menu(void) {
 	list_open(LIST_MENU, "Menu");
-	list_add(s_editing ? "Stop editing keys" : "Edit keys", "Or hold any key to change it", "edit", C_ORANGE, 0);
-	if (g_pads.count < MAX_PAGES) list_add("Add a page", "", "addpage", C_BLUE, 1);
-	list_add("Rename this page", g_pads.pages[s_page].name, "renamepage", C_TEXT2, 2);
-	if (g_pads.count > 1) list_add("Remove this page", g_pads.pages[s_page].name, "removepage", C_RED, 3);
-	list_add(g_config.clock24 ? "Use 12-hour clock" : "Use 24-hour clock", "", "clock", C_TEXT2, 4);
-	list_add("Forget this Mac", g_config.macName, "forget", C_RED, 5);
-	list_add("Quit", "", "quit", C_TEXT2, 6);
+	menu_build();
+}
+
+// The START menu. Built again in place when something in it changes, so the scroll stays put.
+static void menu_build(void) {
+	free(s_list.items);
+	s_list.items = NULL;
+	s_list.count = 0;
+	Item *it;
+
+	list_header("Pages");
+	for (int i = 0; i < g_pads.count; i++) {
+		it = list_add(ROW_CHECK, g_pads.pages[i].name, "page", i);
+		snprintf(it->tag, sizeof it->tag, "%d", i + 1);
+		it->color = i == s_page ? C_BLUE : C_GRAY;
+		it->on = i == s_page;
+	}
+	if (g_pads.count < MAX_PAGES) {
+		it = list_add(ROW_PLAIN, "Add a page", "addpage", 0);
+		it->icon = GLYPH_PLUS;
+		it->color = C_GREEN;
+	}
+
+	list_header(g_pads.pages[s_page].name);
+	it = list_add(ROW_TOGGLE, "Edit keys", "edit", 0);
+	it->icon = GLYPH_PENCIL;
+	it->color = C_ORANGE;
+	it->on = s_editing;
+	it = list_add(ROW_CHEVRON, "Rename page", "renamepage", 0);
+	copy(it->detail, sizeof it->detail, g_pads.pages[s_page].name);
+	copy(it->tag, sizeof it->tag, "Aa");
+	it->color = C_PURPLE;
+	if (g_pads.count > 1) {
+		it = list_add(ROW_PLAIN, "Remove page", "removepage", 0);
+		it->icon = GLYPH_TRASH;
+		it->color = C_RED;
+		it->danger = true;
+	}
+
+	list_header("Clock");
+	it = list_add(ROW_TOGGLE, "24-hour time", "clock", 0);
+	it->icon = GLYPH_CLOCK;
+	it->color = C_BLUE;
+	it->on = g_config.clock24;
+
+	list_header("Your Mac");
+	it = list_add(ROW_PLAIN, "Forget this Mac", "forget", 0);
+	{
+		char host[64], sub[96];
+		int port;
+		if (url_split(g_config.url, host, sizeof host, &port)) snprintf(sub, sizeof sub, "%s \xC2\xB7 %s", g_config.macName, host);
+		else copy(sub, sizeof sub, g_config.macName);
+		copy(it->sub, sizeof it->sub, sub);
+	}
+	it->icon = GLYPH_LAPTOP;
+	it->color = C_RED;
+	it->danger = true;
+
+	list_header("");
+	it = list_add(ROW_PLAIN, "Quit Macapad", "quit", 0);
+	it->icon = GLYPH_POWER;
+	it->color = C_GRAY;
+
+	list_layout();
 }
 
 static const char *s_keyNames[][2] = {
@@ -226,30 +523,36 @@ static const char *s_keyNames[][2] = {
 static void open_keyname_list(void) {
 	list_open(LIST_KEYNAME, "Which key?");
 	char v[4], l[4];
+	list_header("Letters");
 	for (char c = 'a'; c <= 'z'; c++) {
 		snprintf(v, sizeof v, "%c", c);
 		snprintf(l, sizeof l, "%c", c - 32);
-		list_add(l, "", v, C_TEXT, 0);
+		list_add(ROW_PLAIN, l, v, 0);
 	}
+	list_header("Numbers");
 	for (char c = '0'; c <= '9'; c++) {
 		snprintf(v, sizeof v, "%c", c);
-		list_add(v, "", v, C_TEXT, 0);
+		list_add(ROW_PLAIN, v, v, 0);
 	}
-	for (size_t i = 0; i < sizeof s_keyNames / sizeof *s_keyNames; i++) list_add(s_keyNames[i][1], "", s_keyNames[i][0], C_TEXT, 0);
+	list_header("Other keys");
+	for (size_t i = 0; i < sizeof s_keyNames / sizeof *s_keyNames; i++) list_add(ROW_PLAIN, s_keyNames[i][1], s_keyNames[i][0], 0);
+	list_header("Function keys");
 	for (int f = 1; f <= 12; f++) {
 		char fv[8], fl[8];
 		snprintf(fv, sizeof fv, "f%d", f);
 		snprintf(fl, sizeof fl, "F%d", f);
-		list_add(fl, "", fv, C_TEXT, 0);
+		list_add(ROW_PLAIN, fl, fv, 0);
 	}
+	list_layout();
 }
 
-static void set_key(KeyKind kind, const char *label, const char *ref, const char *category) {
+static void set_key(KeyKind kind, const char *label, const char *ref, const char *category, const char *icon) {
 	PadKey *k = edit_key();
 	k->kind = kind;
 	copy(k->label, sizeof k->label, label);
 	copy(k->ref, sizeof k->ref, ref);
 	copy(k->category, sizeof k->category, category);
+	copy(k->icon, sizeof k->icon, icon);
 	pads_save();
 	s_screen = SCR_MAIN;
 }
@@ -271,6 +574,20 @@ static void start_qr(void);
 
 static void list_picked(int i) {
 	Item *it = &s_list.items[i];
+	if (it->id == -1 && searchable()) {
+		list_search();
+		return;
+	}
+	if (is_catalog() || s_list.purpose == LIST_SEARCH) {
+		// a result: the row's id says which kind of key it makes
+		catalogs_finish();
+		switch (it->id) {
+		case KEY_ACTION: set_key(KEY_ACTION, it->label, it->value, it->category, it->iconName); break;
+		case KEY_APP: set_key(KEY_APP, it->label, it->value, "", ""); break;
+		case KEY_SHORTCUT: set_key(KEY_SHORTCUT, it->label, it->value, "", ""); break;
+		}
+		return;
+	}
 	switch (s_list.purpose) {
 	case LIST_KIND:
 		switch (it->id) {
@@ -287,7 +604,7 @@ static void list_picked(int i) {
 				copy(url, sizeof url, full);
 			}
 			url_label(url, label, sizeof label);
-			set_key(KEY_WEB, label, url, "");
+			set_key(KEY_WEB, label, url, "", "");
 			break;
 		}
 		case KEY_KEYS:
@@ -311,9 +628,7 @@ static void list_picked(int i) {
 			break;
 		}
 		break;
-	case LIST_ACTIONS: set_key(KEY_ACTION, it->label, it->value, it->sub); break;
-	case LIST_APPS: set_key(KEY_APP, it->label, it->value, ""); break;
-	case LIST_SHORTCUTS: set_key(KEY_SHORTCUT, it->label, it->value, ""); break;
+	case LIST_ACTIONS: case LIST_APPS: case LIST_SHORTCUTS: case LIST_SEARCH: break;  // above
 	case LIST_KEYNAME:
 		copy(s_keyName, sizeof s_keyName, it->value);
 		copy(s_keyLabel, sizeof s_keyLabel, it->label);
@@ -321,9 +636,12 @@ static void list_picked(int i) {
 		break;
 	case LIST_MENU: {
 		const char *id = it->value;
-		s_screen = SCR_MAIN;
-		if (!strcmp(id, "edit")) {
+		if (!strcmp(id, "page")) {
+			s_page = it->id;
+			menu_build();
+		} else if (!strcmp(id, "edit")) {
 			s_editing = !s_editing;
+			menu_build();
 		} else if (!strcmp(id, "addpage")) {
 			PadPage *p = &g_pads.pages[g_pads.count];
 			memset(p, 0, sizeof *p);
@@ -331,20 +649,24 @@ static void list_picked(int i) {
 			s_page = g_pads.count++;
 			s_editing = true;
 			pads_save();
+			s_screen = SCR_MAIN;
 		} else if (!strcmp(id, "renamepage")) {
 			char name[32];
 			if (ask_text("Page name", g_pads.pages[s_page].name, SWKBD_TYPE_WESTERN, name, sizeof name)) {
 				copy(g_pads.pages[s_page].name, sizeof g_pads.pages[s_page].name, name);
 				pads_save();
 			}
+			menu_build();
 		} else if (!strcmp(id, "removepage")) {
 			memmove(&g_pads.pages[s_page], &g_pads.pages[s_page + 1], (g_pads.count - s_page - 1) * sizeof(PadPage));
 			g_pads.count--;
 			if (s_page >= g_pads.count) s_page = g_pads.count - 1;
 			pads_save();
+			menu_build();
 		} else if (!strcmp(id, "clock")) {
 			g_config.clock24 = !g_config.clock24;
 			config_save();
+			menu_build();
 		} else if (!strcmp(id, "forget")) {
 			macapad_stop();
 			g_config.token[0] = 0;
@@ -361,37 +683,135 @@ static void list_picked(int i) {
 static void list_back(void) {
 	if (s_list.purpose == LIST_KEYNAME) {
 		s_screen = SCR_KEYS;
-	} else if (s_list.purpose == LIST_ACTIONS || s_list.purpose == LIST_APPS || s_list.purpose == LIST_SHORTCUTS) {
-		catalog_finish(&s_catalog);
+	} else if (is_catalog() || s_list.purpose == LIST_SEARCH) {
+		catalogs_finish();
 		open_kind_menu();
 	} else {
 		s_screen = SCR_MAIN;
 	}
 }
 
-static void list_update(u32 down, u32 held, touchPosition touch) {
-	if (s_list.loading && s_catalog.done) {
-		s_list.loading = false;
-		if (!s_catalog.ok) copy(s_list.empty, sizeof s_list.empty, s_catalog.error);
-		for (int i = 0; i < s_catalog.count; i++) {
-			CatalogItem *c = &s_catalog.items[i];
-			u32 color = s_list.purpose == LIST_ACTIONS ? category_color(c->sub) : s_list.purpose == LIST_APPS ? C_BLUE : C_PURPLE;
-			list_add(c->label, c->sub, c->value, color, 0);
+// Rows for the items of one catalog that match the filter. For actions, a title wherever the
+// category changes. Each row's id is the kind of key it makes.
+static int add_catalog_rows(CatalogKind kind, bool categoryTitles) {
+	Catalog *cat = &s_cats[kind];
+	char lastCat[16] = "";
+	int n = 0;
+	for (int i = 0; i < cat->count; i++) {
+		CatalogItem *c = &cat->items[i];
+		if (!contains_ci(c->label, s_list.filter)) continue;
+		n++;
+		Item *it;
+		switch (kind) {
+		case CATALOG_ACTIONS:
+			if (categoryTitles && strcmp(c->sub, lastCat)) {
+				list_header(c->sub[0] ? c->sub : "Other");
+				copy(lastCat, sizeof lastCat, c->sub);
+			}
+			it = list_add(ROW_PLAIN, c->label, c->value, KEY_ACTION);
+			it->icon = action_glyph(c->value, c->icon);
+			it->color = category_color(c->sub);
+			copy(it->category, sizeof it->category, c->sub);
+			copy(it->iconName, sizeof it->iconName, c->icon);
+			break;
+		case CATALOG_APPS:
+			it = list_add(ROW_PLAIN, c->label, c->value, KEY_APP);
+			it->tag[0] = (char)toupper((unsigned char)c->label[0]);
+			it->color = C_BLUE;
+			break;
+		case CATALOG_SHORTCUTS:
+			it = list_add(ROW_PLAIN, c->label, c->value, KEY_SHORTCUT);
+			it->icon = GLYPH_SHORTCUT;
+			it->color = C_PURPLE;
+			break;
 		}
-		if (s_catalog.ok && s_catalog.count == 0)
-			copy(s_list.empty, sizeof s_list.empty, s_list.purpose == LIST_SHORTCUTS ? "No shortcuts in the Shortcuts app yet." : "Nothing here.");
-		catalog_finish(&s_catalog);
+	}
+	return n;
+}
+
+static int matches_in(CatalogKind kind) {
+	int n = 0;
+	for (int i = 0; i < s_cats[kind].count; i++) n += contains_ci(s_cats[kind].items[i].label, s_list.filter);
+	return n;
+}
+
+// The rows of a catalog list: the search field, then what matches. Built again whenever the
+// filter changes; the catalogs stay loaded until the list closes.
+static void list_fill_catalog(void) {
+	static const char *prompts[] = {"Search actions", "Search apps", "Search Shortcuts"};
+	static const char *titles[] = {"Mac actions", "Apps", "Shortcuts"};
+	free(s_list.items);
+	s_list.items = NULL;
+	s_list.count = s_list.results = 0;
+	s_list.scroll = 0;
+
+	bool all = s_list.purpose == LIST_SEARCH;
+	CatalogKind one = s_list.purpose == LIST_ACTIONS ? CATALOG_ACTIONS : s_list.purpose == LIST_APPS ? CATALOG_APPS : CATALOG_SHORTCUTS;
+	add_search_row(all ? "Search actions, apps, Shortcuts" : prompts[one]);
+	if (all) {
+		for (int k = 0; k < 3; k++) {
+			if (!matches_in(k)) continue;
+			list_header(titles[k]);
+			s_list.results += add_catalog_rows(k, false);
+		}
+	} else {
+		s_list.results = add_catalog_rows(one, true);
+	}
+
+	if (s_list.filter[0]) snprintf(s_list.items[0].detail, sizeof s_list.items[0].detail, "%d found", s_list.results);
+	s_list.empty[0] = 0;
+	if (s_list.results == 0) {
+		bool anyOk = false;
+		const char *error = NULL;
+		for (int k = 0; k < 3; k++) {
+			if (!(s_wantCats >> k & 1)) continue;
+			if (s_cats[k].ok) anyOk = true;
+			else if (!error) error = s_cats[k].error;
+		}
+		if (!anyOk && error) copy(s_list.empty, sizeof s_list.empty, error);
+		else if (s_list.filter[0]) snprintf(s_list.empty, sizeof s_list.empty, "Nothing called \xE2\x80\x9C%s\xE2\x80\x9D", s_list.filter);
+		else copy(s_list.empty, sizeof s_list.empty, s_list.purpose == LIST_SHORTCUTS ? "No shortcuts in the Shortcuts app yet." : "Nothing here.");
+	}
+	s_list.sel = s_list.results ? 2 : 0;  // the first match, past the field and the gap
+	list_layout();
+}
+
+// Asks what to look for; an empty answer shows everything again.
+static void list_search(void) {
+	static const char *hints[] = {"Search Mac actions", "Search apps", "Search Shortcuts"};
+	const char *hint = s_list.purpose == LIST_ACTIONS ? hints[0] : s_list.purpose == LIST_APPS ? hints[1]
+	                 : s_list.purpose == LIST_SHORTCUTS ? hints[2] : "Search actions, apps and Shortcuts";
+	char q[48];
+	if (!ask_text_opt(hint, s_list.filter, SWKBD_TYPE_WESTERN, false, q, sizeof q)) return;
+	// trim spaces
+	char *start = q;
+	while (*start == ' ') start++;
+	for (char *end = start + strlen(start); end > start && end[-1] == ' '; ) *--end = 0;
+	if (s_list.purpose == LIST_KIND) {
+		if (*start) open_search(start);  // from the first question: look everywhere
+		return;
+	}
+	copy(s_list.filter, sizeof s_list.filter, start);
+	if (s_list.loading) return;  // applied once the Mac answers
+	list_fill_catalog();
+}
+
+static void list_update(u32 down, u32 held, touchPosition touch) {
+	if (s_list.loading) {
+		bool done = true;
+		for (int k = 0; k < 3; k++) if ((s_wantCats >> k & 1) && !s_cats[k].done) done = false;
+		if (done) {
+			s_list.loading = false;
+			list_fill_catalog();
+		}
 	}
 
 	if (down & KEY_B) { list_back(); return; }
-	if (down & (KEY_DOWN | KEY_UP | KEY_L | KEY_R) && s_list.count) {
-		int step = (down & KEY_DOWN) ? 1 : (down & KEY_UP) ? -1 : (down & KEY_R) ? 6 : -6;
-		s_list.sel += step;
-		if (s_list.sel < 0) s_list.sel = 0;
-		if (s_list.sel >= s_list.count) s_list.sel = s_list.count - 1;
-		list_show_sel();
-	}
-	if ((down & KEY_A) && s_list.count) { list_picked(s_list.sel); return; }
+	if ((down & KEY_Y) && searchable()) { list_search(); return; }
+	if ((down & KEY_START) && s_list.purpose == LIST_MENU) { list_back(); return; }
+	if (down & (KEY_DOWN | KEY_UP | KEY_L | KEY_R) && s_list.count)
+		list_move((down & KEY_DOWN) ? 1 : (down & KEY_UP) ? -1 : (down & KEY_R) ? 5 : -5);
+	if ((down & KEY_A) && pickable(s_list.sel)) { list_picked(s_list.sel); return; }
 
 	circlePosition cp;
 	hidCircleRead(&cp);
@@ -403,6 +823,7 @@ static void list_update(u32 down, u32 held, touchPosition touch) {
 	// touch: drag scrolls, a tap picks
 	if (down & KEY_TOUCH) {
 		if (in(touch, 0, 0, 90, 32)) { list_back(); return; }
+		if (searchable() && in(touch, BOTTOM_W - 48, 0, 48, 32)) { list_search(); return; }
 		s_scrollStart = s_list.scroll;
 	}
 	if ((held & KEY_TOUCH) && s_touching && s_touchStart.py >= LIST_TOP) {
@@ -413,37 +834,112 @@ static void list_update(u32 down, u32 held, touchPosition touch) {
 
 static void list_tap(touchPosition t) {
 	if (t.py < LIST_TOP || s_list.loading) return;
-	int i = (int)((t.py - LIST_TOP + s_list.scroll) / ROW_H);
-	if (i >= 0 && i < s_list.count) {
+	float y = t.py - LIST_TOP + s_list.scroll;
+	for (int i = 0; i < s_list.count; i++) {
+		Item *it = &s_list.items[i];
+		if (y < it->y || y >= it->y + it->h) continue;
+		if (!pickable(i)) return;
 		s_list.sel = i;
 		list_picked(i);
+		return;
 	}
 }
 
-static void header(const char *title, const char *back) {
+static void header(const char *title, const char *back, bool search) {
 	C2D_DrawRectSolid(0, 0, 0.5f, BOTTOM_W, 30, C_BG);
 	C2D_DrawRectSolid(0, 30, 0.5f, BOTTOM_W, 1, C_LINE);
 	if (back) text(10, 7, 0.5f, C_BLUE, 0, back);
+	if (search) glyph(GLYPH_SEARCH, BOTTOM_W - 20, 15, 15, C_BLUE, C_BG);
 	text_fit(BOTTOM_W / 2, 7, 0.5f, C_TEXT, C2D_AlignCenter, 170, title);
 }
 
+// The square at the left of a row, with a glyph or a couple of letters on it.
+static void tile(float x, float y, u32 color, Glyph g, const char *tag) {
+	rrect(x, y, TILE, TILE, 6, color);
+	if (g != GLYPH_NONE) glyph(g, x + TILE / 2, y + TILE / 2, 13, C_TEXT, color);
+	else if (tag[0]) text(x + TILE / 2, y + 5, strlen(tag) > 1 ? 0.42f : 0.5f, C_TEXT, C2D_AlignCenter, tag);
+}
+
+static void toggle(float rx, float cy, bool on) {
+	rrect(rx - 40, cy - 11, 40, 22, 11, on ? C_GREEN : C_CARD_HI);
+	disc(on ? rx - 11 : rx - 29, cy, 9, C_TEXT);
+}
+
 static void list_draw(void) {
+	// the cards first, whole, so one whose first row has scrolled off still has a background
 	for (int i = 0; i < s_list.count; i++) {
-		float y = LIST_TOP + i * ROW_H - s_list.scroll;
-		if (y + ROW_H < LIST_TOP || y > SCREEN_H) continue;
 		Item *it = &s_list.items[i];
-		if (i == s_list.sel) rrect(4, y + 1, BOTTOM_W - 8, ROW_H - 2, 8, C_CARD_HI);
-		disc(18, y + ROW_H / 2, 5, it->color);
-		bool twoLine = it->sub[0] && s_list.purpose != LIST_ACTIONS;
-		text_fit(32, y + (twoLine ? 3 : 9), 0.52f, it->color == C_RED ? C_RED : C_TEXT, 0, twoLine ? 270 : 200, it->label);
-		if (twoLine) text_fit(32, y + 19, 0.4f, C_TEXT2, 0, 270, it->sub);
-		else if (it->sub[0]) text(BOTTOM_W - 14, y + 11, 0.42f, C_TEXT3, C2D_AlignRight, it->sub);
-		if (i < s_list.count - 1) C2D_DrawRectSolid(32, y + ROW_H - 1, 0.5f, BOTTOM_W - 40, 1, C_LINE);
+		if (it->style == ROW_HEADER || it->style == ROW_SEARCH || !it->first) continue;
+		int j = i;
+		while (!s_list.items[j].last) j++;
+		float y = LIST_TOP + it->y - s_list.scroll, h = s_list.items[j].y + s_list.items[j].h - it->y;
+		if (y + h >= LIST_TOP && y <= SCREEN_H) rrect(CARD_X, y, CARD_W, h, 10, C_CARD);
+	}
+	for (int i = 0; i < s_list.count; i++) {
+		Item *it = &s_list.items[i];
+		float y = LIST_TOP + it->y - s_list.scroll;
+		if (y + it->h < LIST_TOP || y > SCREEN_H) continue;
+		if (it->style == ROW_HEADER) {
+			if (it->label[0]) text(CARD_X + 12, y + it->h - 16, 0.36f, C_TEXT2, 0, it->label);
+			continue;
+		}
+		if (it->style == ROW_SEARCH) {
+			float cy = y + it->h / 2, right = CARD_X + CARD_W - 14;
+			rrect(CARD_X, y, CARD_W, it->h, it->h / 2, i == s_list.sel ? C_CARD_HI : C_CARD);
+			glyph(GLYPH_SEARCH, CARD_X + 19, cy, 13, C_TEXT2, C_CARD);
+			float w = it->detail[0] ? text_width(it->detail, 0.42f) + 10 : 0;
+			if (it->detail[0]) text(right, cy - 7, 0.42f, C_TEXT2, C2D_AlignRight, it->detail);
+			text_fit(CARD_X + 34, cy - 8, 0.5f, it->on ? C_TEXT : C_TEXT3, 0, right - w - (CARD_X + 34), it->label);
+			continue;
+		}
+		if (i == s_list.sel) rrect(CARD_X + 2, y + 2, CARD_W - 4, it->h - 4, 8, C_CARD_HI);
+
+		float x = CARD_X + 12, right = CARD_X + CARD_W - 12, cy = y + it->h / 2;
+		bool hasTile = it->icon != GLYPH_NONE || it->tag[0];
+		if (hasTile) {
+			tile(x, cy - TILE / 2, it->color, it->icon, it->tag);
+			x += TILE + 10;
+		}
+		float textRight = right;
+		switch (it->style) {
+		case ROW_TOGGLE:
+			toggle(right, cy, it->on);
+			textRight = right - 48;
+			break;
+		case ROW_CHEVRON:
+			glyph(GLYPH_CHEVRON_R, right - 5, cy, 12, C_TEXT3, C_CARD);
+			textRight = right - 16;
+			if (it->detail[0]) {
+				text_fit(textRight, cy - 7, 0.44f, C_TEXT2, C2D_AlignRight, 120, it->detail);
+				float w = text_width(it->detail, 0.44f);
+				textRight -= (w > 120 ? 120 : w) + 8;
+			}
+			break;
+		case ROW_CHECK:
+			if (it->on) glyph(GLYPH_CHECK, right - 8, cy, 14, C_BLUE, C_CARD);
+			textRight = right - 22;
+			break;
+		default:
+			if (it->detail[0]) {
+				text_fit(right, cy - 7, 0.44f, C_TEXT2, C2D_AlignRight, 120, it->detail);
+				float w = text_width(it->detail, 0.44f);
+				textRight = right - (w > 120 ? 120 : w) - 8;
+			}
+			break;
+		}
+		u32 color = it->danger ? C_RED : C_TEXT;
+		if (it->sub[0]) {
+			text_fit(x, y + 5, 0.5f, color, 0, textRight - x, it->label);
+			text_fit(x, y + 23, 0.38f, C_TEXT2, 0, textRight - x, it->sub);
+		} else {
+			text_fit(x, cy - 8, 0.5f, color, 0, textRight - x, it->label);
+		}
+		if (!it->last) C2D_DrawRectSolid(x, y + it->h - 1, 0.5f, right - x, 1, C_LINE);
 	}
 	if (s_list.loading) text(BOTTOM_W / 2, 110, 0.5f, C_TEXT2, C2D_AlignCenter, "Asking your Mac\xE2\x80\xA6");
-	else if (!s_list.count) text(BOTTOM_W / 2, 110, 0.48f, C_TEXT2, C2D_AlignCenter, s_list.empty);
+	else if (s_list.empty[0] && !s_list.results) text_fit(BOTTOM_W / 2, 110, 0.46f, C_TEXT2, C2D_AlignCenter, 300, s_list.empty);
 	bool back = s_list.purpose != LIST_MENU && s_list.purpose != LIST_KIND;
-	header(s_list.title, back ? "\xE2\x80\xB9 Back" : "\xE2\x80\xB9 Done");
+	header(s_list.title, back ? "\xE2\x80\xB9 Back" : "\xE2\x80\xB9 Done", searchable());
 }
 
 // ---- keyboard shortcut builder -------------------------------------------------------
@@ -477,12 +973,12 @@ static void keys_tap(touchPosition t) {
 	if (s_keyName[0] && in(t, 8, 184, 304, 44)) {
 		char keys[64], label[48];
 		keys_combo(keys, sizeof keys, label, sizeof label);
-		set_key(KEY_KEYS, label, keys, "");
+		set_key(KEY_KEYS, label, keys, "", "");
 	}
 }
 
 static void keys_draw(void) {
-	header("Keyboard shortcut", "\xE2\x80\xB9 Back");
+	header("Keyboard shortcut", "\xE2\x80\xB9 Back", false);
 	text(BOTTOM_W / 2, 40, 0.45f, C_TEXT2, C2D_AlignCenter, "Hold down\xE2\x80\xA6");
 	for (int i = 0; i < 4; i++) {
 		float x = 8 + i * (MOD_W + 4);
@@ -534,47 +1030,62 @@ static void pad_tap(int slot) {
 	press_key(k);
 }
 
-static Glyph action_glyph(const char *id, bool *found) {
-	*found = true;
-	if (!strcmp(id, "play-pause")) return s_st.hasTrack && s_st.playing ? GLYPH_PAUSE : GLYPH_PLAY;
-	if (!strcmp(id, "next-track")) return GLYPH_NEXT;
-	if (!strcmp(id, "previous-track")) return GLYPH_PREV;
-	if (!strcmp(id, "volume-up")) return GLYPH_VOL_UP;
-	if (!strcmp(id, "volume-down")) return GLYPH_VOL_DOWN;
-	if (!strcmp(id, "mute")) return GLYPH_MUTE;
-	*found = false;
-	return GLYPH_BOLT;
+// To the next (+1) or previous (-1) page; it slides into place over the next few frames.
+static void go_page(int dir) {
+	if (g_pads.count < 2) return;
+	s_page = (s_page + dir + g_pads.count) % g_pads.count;
+	s_slide += dir * BOTTOM_W;
+	if (s_slide > BOTTOM_W) s_slide = BOTTOM_W;
+	if (s_slide < -BOTTOM_W) s_slide = -BOTTOM_W;
 }
 
-static void key_draw(int slot) {
-	PadKey *k = &g_pads.pages[s_page].keys[slot];
-	float x = GRID_X + (slot % COLS) * (KEY_W + GAP), y = GRID_Y + (slot / COLS) * (KEY_H + GAP);
-	float cx = x + KEY_W / 2, iconY = y + 23;
-	bool flash = slot == s_flashSlot && osGetTime() < s_flashUntil;
-
-	if (k->kind == KEY_NONE) {
-		rrect(x, y, KEY_W, KEY_H, 12, C2D_Color32(0x1C, 0x1C, 0x1E, 0x80));
-		glyph(GLYPH_PLUS, cx, y + KEY_H / 2, 14, s_editing ? C_ORANGE : C_TEXT3);
+// A tap on the pad, or on the bar above it: ‹ page name ›, or the editing notice.
+static void main_tap(touchPosition t) {
+	if (t.py >= GRID_Y) {
+		pad_tap(slot_at(t));
 		return;
 	}
-	rrect(x, y, KEY_W, KEY_H, 12, flash ? C_CARD_HI : C_CARD);
-	switch (k->kind) {
-	case KEY_ACTION: {
-		bool media;
-		Glyph g = action_glyph(k->ref, &media);
-		glyph(g, cx, iconY, media ? 20 : 18, category_color(k->category));
-		break;
+	if (s_editing) {
+		s_editing = false;
+	} else if (g_pads.count > 1 && t.px < 48) {
+		go_page(-1);
+	} else if (g_pads.count > 1 && t.px >= BOTTOM_W - 48) {
+		go_page(+1);
+	} else {
+		open_menu();
 	}
+}
+
+static void key_draw(int page, int slot, float dx, bool pressed) {
+	PadKey *k = &g_pads.pages[page].keys[slot];
+	float x = GRID_X + (slot % COLS) * (KEY_W + GAP) + dx, y = GRID_Y + (slot / COLS) * (KEY_H + GAP);
+	if (x + KEY_W <= 0 || x >= BOTTOM_W) return;
+	float cx = x + KEY_W / 2, iconY = y + 23;
+	bool flash = pressed || (page == s_page && slot == s_flashSlot && osGetTime() < s_flashUntil);
+
+	if (k->kind == KEY_NONE) {
+		u32 bg = C2D_Color32(0x1C, 0x1C, 0x1E, 0x80);
+		rrect(x, y, KEY_W, KEY_H, 12, bg);
+		glyph(GLYPH_PLUS, cx, y + KEY_H / 2, 14, s_editing ? C_ORANGE : C_TEXT3, bg);
+		return;
+	}
+	u32 bg = flash ? C_CARD_HI : C_CARD;
+	rrect(x, y, KEY_W, KEY_H, 12, bg);
+	switch (k->kind) {
+	case KEY_ACTION:
+		glyph(action_glyph(k->ref, k->icon), cx, iconY, 20, category_color(k->category), bg);
+		break;
 	case KEY_APP: {
 		Icon *icon = icon_for(k->ref);
 		if (icon && icon->state == 2) picture_draw(&icon->pic, cx - 16, iconY - 16, 32, 32);
-		else rrect(cx - 14, iconY - 14, 28, 28, 7, C_CARD_HI);
+		else glyph(GLYPH_APP, cx, iconY, 26, C_CARD_HI, bg);
 		break;
 	}
-	case KEY_WEB: glyph(GLYPH_GLOBE, cx, iconY, 22, C_TEAL); break;
-	case KEY_KEYS: glyph(GLYPH_KEYS, cx, iconY, 24, C_ORANGE); break;
+	case KEY_WEB: glyph(GLYPH_GLOBE, cx, iconY, 22, C_TEAL, bg); break;
+	case KEY_KEYS: glyph(GLYPH_KEYS, cx, iconY, 22, C_ORANGE, bg); break;
 	case KEY_SHORTCUT:
 		rrect(cx - 12, iconY - 12, 18, 18, 5, C_PINK);
+		rrect(cx - 7.5f, iconY - 7.5f, 21, 21, 6, bg);
 		rrect(cx - 6, iconY - 6, 18, 18, 5, C_PURPLE);
 		break;
 	default: break;
@@ -584,24 +1095,33 @@ static void key_draw(int slot) {
 	if (s_st.off) rrect(x, y, KEY_W, KEY_H, 12, C2D_Color32(0, 0, 0, 0x90));
 }
 
+static void page_draw(int page, float dx, int pressedSlot) {
+	for (int s = 0; s < SLOTS; s++) key_draw(page, s, dx, page == s_page && s == pressedSlot);
+}
+
 static void pad_draw(void) {
 	PadPage *p = &g_pads.pages[s_page];
 	if (s_editing) {
 		rrect(4, 3, BOTTOM_W - 8, 25, 8, C_ORANGE);
-		text(BOTTOM_W / 2, 7, 0.46f, C_BG, C2D_AlignCenter, "Tap a key to change it. SELECT when done.");
+		text(BOTTOM_W / 2, 7, 0.44f, C_BG, C2D_AlignCenter, "Tap a key to change it \xC2\xB7 tap here when done");
 	} else {
 		if (g_pads.count > 1) {
-			rrect(6, 6, 26, 18, 6, C_CARD);
-			text(19, 7, 0.42f, C_TEXT2, C2D_AlignCenter, "L");
-			rrect(BOTTOM_W - 32, 6, 26, 18, 6, C_CARD);
-			text(BOTTOM_W - 19, 7, 0.42f, C_TEXT2, C2D_AlignCenter, "R");
+			rrect(6, 5, 34, 22, 7, C_CARD);
+			glyph(GLYPH_CHEVRON_L, 23, 16, 13, C_TEXT2, C_CARD);
+			rrect(BOTTOM_W - 40, 5, 34, 22, 7, C_CARD);
+			glyph(GLYPH_CHEVRON_R, BOTTOM_W - 23, 16, 13, C_TEXT2, C_CARD);
 		}
 		text_fit(BOTTOM_W / 2, 4, 0.48f, C_TEXT, C2D_AlignCenter, 200, p->name);
 		float dotsW = g_pads.count * 9;
 		for (int i = 0; i < g_pads.count && g_pads.count > 1; i++)
 			disc(BOTTOM_W / 2 - dotsW / 2 + i * 9 + 4, 25, 2.5f, i == s_page ? C_TEXT : C_TEXT3);
 	}
-	for (int s = 0; s < SLOTS; s++) key_draw(s);
+	int pressed = s_touching && !s_dragging && !s_longFired ? slot_at(s_touchStart) : -1;
+	page_draw(s_page, s_slide, pressed);
+	if (g_pads.count > 1) {
+		if (s_slide > 0.5f) page_draw((s_page + g_pads.count - 1) % g_pads.count, s_slide - BOTTOM_W, -1);
+		else if (s_slide < -0.5f) page_draw((s_page + 1) % g_pads.count, s_slide + BOTTOM_W, -1);
+	}
 }
 
 static void main_update(u32 down) {
@@ -614,16 +1134,37 @@ static void main_update(u32 down) {
 	}
 	if (down & KEY_START) { open_menu(); return; }
 	if (down & KEY_SELECT) s_editing = !s_editing;
-	if (g_pads.count > 1) {
-		if (down & KEY_L) s_page = (s_page + g_pads.count - 1) % g_pads.count;
-		if (down & KEY_R) s_page = (s_page + 1) % g_pads.count;
-	}
+	if (down & KEY_L) go_page(-1);
+	if (down & KEY_R) go_page(+1);
 	if (down & KEY_X) press_action("play-pause");
 	if (down & KEY_DLEFT) press_action("previous-track");
 	if (down & KEY_DRIGHT) press_action("next-track");
 	if (down & KEY_DUP) press_action("volume-up");
 	if (down & KEY_DDOWN) press_action("volume-down");
 	if (down & KEY_Y) press_action("mute");
+}
+
+// A sideways drag moves the pages with the finger; letting go past the mark (or a quick
+// flick) turns the page, otherwise it settles back. Up-and-down drags are left alone.
+static void swipe_update(bool released) {
+	if (s_touching && s_dragging) {
+		int dx = s_touchNow.px - s_touchStart.px, dy = s_touchNow.py - s_touchStart.py;
+		if (!s_swipeAxis) {
+			s_swipeAxis = true;
+			s_swiping = abs(dx) >= abs(dy);
+		}
+		if (s_swiping) s_slide = g_pads.count > 1 ? dx : dx * 0.25f;  // one page: a little give, no turn
+	}
+	if (released && s_swiping) {
+		s_swiping = false;
+		int dx = s_touchNow.px - s_touchStart.px;
+		bool flick = osGetTime() - s_touchAt < FLICK_MS && abs(dx) >= FLICK_PX;
+		if (abs(dx) >= SWIPE_COMMIT || flick) go_page(dx < 0 ? +1 : -1);
+	}
+	if (!s_swiping && s_slide != 0) {
+		s_slide *= 0.68f;
+		if (fabsf(s_slide) < 0.5f) s_slide = 0;
+	}
 }
 
 // ---- top screen dashboard --------------------------------------------------------------
@@ -752,6 +1293,21 @@ static void draw_music_note(float x, float y, float s, u32 c) {
 #define CARD_Y 78
 #define CARD_H 96
 
+// What the music is doing, centered on (cx, cy): bars that bounce while it plays, or the
+// pause sign with "Paused" under it. (The state, not a button: the Play/Pause key is below.)
+static void draw_play_state(float cx, float cy) {
+	if (s_st.playing) {
+		float t = osGetTime() / 1000.0f;
+		for (int i = 0; i < 4; i++) {
+			float h = 7 + 6 * (0.5f + 0.5f * sinf(t * (5.5f + i * 1.3f) + i * 1.9f));
+			rrect(cx - 10 + i * 6, cy + 7 - h, 4, h, 1.5f, C_GREEN);
+		}
+		return;
+	}
+	glyph(GLYPH_PAUSE, cx, cy - 2, 11, C_TEXT2, C_CARD);
+	text(cx, cy + 7, 0.34f, C_TEXT3, C2D_AlignCenter, "Paused");
+}
+
 static void draw_now_playing(void) {
 	rrect(12, CARD_Y, TOP_W - 24, CARD_H, 14, C_CARD);
 	if (s_st.outdated && !s_st.have) {
@@ -784,12 +1340,12 @@ static void draw_now_playing(void) {
 		draw_music_note(ax + 22, ay + 20, 40, C_TEXT3);
 	}
 	float tx = ax + as + 12, tw = TOP_W - 24 - tx;
-	text_fit(tx, CARD_Y + 8, 0.62f, C_TEXT, 0, tw - 20, s_st.title);
-	text_fit(tx, CARD_Y + 30, 0.5f, C_TEXT2, 0, tw, s_st.artist);
+	text_fit(tx, CARD_Y + 8, 0.62f, C_TEXT, 0, tw - 28, s_st.title);
+	text_fit(tx, CARD_Y + 30, 0.5f, C_TEXT2, 0, tw - (s_st.playing ? 0 : 50), s_st.artist);
 	char sub[160];
 	snprintf(sub, sizeof sub, "%s%s%s", s_st.album, s_st.album[0] ? " \xC2\xB7 " : "", s_st.app);
 	text_fit(tx, CARD_Y + 48, 0.42f, C_TEXT3, 0, tw, sub);
-	glyph(s_st.playing ? GLYPH_PAUSE : GLYPH_PLAY, TOP_W - 30, CARD_Y + 18, 12, C_TEXT2);
+	draw_play_state(TOP_W - 30, CARD_Y + 17);
 
 	int pos = s_st.position;
 	if (s_st.playing) pos += (int)(osGetTime() - s_st.receivedAt);
@@ -969,7 +1525,7 @@ static void find_draw_top(void) {
 }
 
 static void find_draw_bottom(void) {
-	header(s_scan.running ? "Looking\xE2\x80\xA6" : s_scan.count ? "Pick your Mac" : "No Mac found", NULL);
+	header(s_scan.running ? "Looking\xE2\x80\xA6" : s_scan.count ? "Pick your Mac" : "No Mac found", NULL, false);
 	if (s_scan.running) {
 		rrect(40, 44, 240, 6, 3, C_CARD);
 		rrect(40, 44, 240 * s_scan.progress / 254.0f, 6, 3, C_BLUE);
@@ -1058,7 +1614,7 @@ static void qr_draw_top(void) {
 }
 
 static void qr_draw_bottom(void) {
-	header("Scan code", NULL);
+	header("Scan code", NULL, false);
 	text(20, 46, 0.48f, C_TEXT, 0, "1. On your Mac, click Macapad in");
 	text(20, 64, 0.48f, C_TEXT, 0, "    the menu bar.");
 	text(20, 88, 0.48f, C_TEXT, 0, "2. Choose Pair with QR Code\xE2\x80\xA6");
@@ -1136,7 +1692,7 @@ static void pair_draw_top(void) {
 static void pair_draw_bottom(void) {
 	PairState st = s_pair.state;
 	bool finished = st == PAIR_DENIED || st == PAIR_EXPIRED || st == PAIR_FAILED;
-	header("Pair", NULL);
+	header("Pair", NULL, false);
 	text(BOTTOM_W / 2, 90, 0.48f, C_TEXT2, C2D_AlignCenter, finished ? "Want to try again?" : "Look at your Mac's screen.");
 	rrect(8, 196, 304, 38, 10, C_CARD);
 	text(BOTTOM_W / 2, 206, 0.5f, finished ? C_BLUE : C_RED, C2D_AlignCenter, finished ? "Try again" : "Cancel");
@@ -1170,12 +1726,12 @@ int main(void) {
 		hidTouchRead(&touch);
 
 		// turn raw touch into taps, drags and long presses
-		bool tapped = false;
+		bool tapped = false, released = false;
 		touchPosition tap = s_touchStart;
 		if (down & KEY_TOUCH) {
 			s_touching = true;
-			s_dragging = s_longFired = false;
-			s_touchStart = touch;
+			s_dragging = s_longFired = s_swiping = s_swipeAxis = false;
+			s_touchStart = s_touchNow = touch;
 			s_touchAt = osGetTime();
 		}
 		if ((held & KEY_TOUCH) && s_touching) {
@@ -1184,6 +1740,7 @@ int main(void) {
 		}
 		if ((up & KEY_TOUCH) && s_touching) {
 			s_touching = false;
+			released = true;
 			tapped = !s_dragging && !s_longFired;
 		}
 
@@ -1210,13 +1767,18 @@ int main(void) {
 		case SCR_MAIN:
 			main_update(down);
 			if (s_screen != SCR_MAIN) break;
+			swipe_update(released);
 			// hold a key to change it
 			if (s_touching && !s_dragging && !s_longFired && osGetTime() - s_touchAt > LONG_PRESS_MS) {
 				int slot = slot_at(s_touchStart);
 				s_longFired = true;
 				if (slot >= 0) edit_slot(slot);
 			} else if (tapped) {
-				pad_tap(slot_at(tap));
+				main_tap(tap);
+			}
+			if (s_screen != SCR_MAIN) {
+				s_slide = 0;
+				s_swiping = false;
 			}
 			break;
 		case SCR_LIST:
@@ -1254,7 +1816,7 @@ int main(void) {
 	scan_finish(&s_scan);
 	stop_qr();
 	pair_finish(&s_pair);
-	catalog_finish(&s_catalog);
+	catalogs_finish();
 	macapad_stop();
 	picture_free(&s_art);
 	for (int i = 0; i < 48; i++) picture_free(&s_icons[i].pic);

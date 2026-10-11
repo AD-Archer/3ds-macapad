@@ -125,6 +125,7 @@ void pads_load(void) {
 			copy(p->keys[s].label, sizeof p->keys[s].label, jstr(k, "label"));
 			copy(p->keys[s].ref, sizeof p->keys[s].ref, jstr(k, "ref"));
 			copy(p->keys[s].category, sizeof p->keys[s].category, jstr(k, "category"));
+			copy(p->keys[s].icon, sizeof p->keys[s].icon, jstr(k, "icon"));
 		}
 	}
 	json_decref(root);
@@ -144,6 +145,7 @@ void pads_save(void) {
 			}
 			json_t *obj = json_pack("{s:s,s:s,s:s}", "kind", kinds[k->kind], "label", k->label, "ref", k->ref);
 			if (k->category[0]) json_object_set_new(obj, "category", json_string(k->category));
+			if (k->icon[0]) json_object_set_new(obj, "icon", json_string(k->icon));
 			json_array_append_new(keys, obj);
 		}
 		json_array_append_new(pages, json_pack("{s:s,s:o}", "name", p->name, "keys", keys));
@@ -155,11 +157,15 @@ void pads_save(void) {
 
 // ---- talking to the Mac ------------------------------------------------------
 
-static bool request(const char *method, const char *path, const char *body, HttpResponse *res, int timeout) {
+// conn may be NULL for a one-off connection.
+static bool request(HttpConn *conn, const char *method, const char *path, const char *body, HttpResponse *res, int timeout) {
 	char host[64];
 	int port;
-	if (!url_split(g_config.url, host, sizeof host, &port)) return false;
-	return http_request(method, host, port, path, g_config.token, body, res, timeout);
+	if (!url_split(g_config.url, host, sizeof host, &port)) {
+		memset(res, 0, sizeof *res);
+		return false;
+	}
+	return http_request_on(conn, method, host, port, path, g_config.token, body, res, timeout);
 }
 
 // ---- status thread -----------------------------------------------------------
@@ -169,6 +175,8 @@ static Status s_status;
 static Thread s_statusThread, s_pressThread, s_iconThread;
 static volatile bool s_quit;
 static LightEvent s_pressEvent, s_iconEvent;
+// The status and press threads each keep their connection to the Mac open between requests.
+static HttpConn s_statusConn, s_pressConn;
 
 static u8 *s_artPixels;
 static int s_artW, s_artH;
@@ -285,7 +293,7 @@ static void apply_status(json_t *root) {
 		return;
 	}
 	HttpResponse res;
-	if (request("GET", "/api/status/artwork?size=128", NULL, &res, TIMEOUT_MS) && res.status == 200) {
+	if (request(NULL, "GET", "/api/status/artwork?size=128", NULL, &res, TIMEOUT_MS) && res.status == 200) {
 		int w, h;
 		u8 *px = png_decode(res.body, res.len, &w, &h);
 		set_artwork(px, w, h);
@@ -322,7 +330,7 @@ static void status_thread(void *arg) {
 	while (!s_quit) {
 		u64 started = osGetTime();
 		HttpResponse res;
-		if (request("GET", "/api/status", NULL, &res, TIMEOUT_MS) && res.status == 200) {
+		if (request(&s_statusConn, "GET", "/api/status", NULL, &res, TIMEOUT_MS) && res.status == 200) {
 			json_t *root = json_loadb(res.body, res.len, 0, NULL);
 			if (root) apply_status(root);
 			json_decref(root);
@@ -370,28 +378,27 @@ bool toast_get(char *out, size_t size, bool *isError) {
 
 // ---- press queue -----------------------------------------------------------------
 
-#define QUEUE 16
-static char *s_queue[QUEUE];
+// Steps waiting to go to the Mac. Everything queued by the time the press thread gets to it
+// goes in one request, in order, so tapping quickly doesn't cost a round trip per tap.
+#define QUEUE 32
+static json_t *s_queue[QUEUE];
 static int s_qHead, s_qTail;
 
-static void enqueue(json_t *steps) {
-	json_t *body = json_pack("{s:o}", "steps", steps);
-	char *text = json_dumps(body, JSON_COMPACT);
-	json_decref(body);
+static void enqueue(json_t *step) {
 	LightLock_Lock(&s_lock);
 	int next = (s_qTail + 1) % QUEUE;
 	if (next != s_qHead) {
-		s_queue[s_qTail] = text;
+		s_queue[s_qTail] = step;
 		s_qTail = next;
-		text = NULL;
+		step = NULL;
 	}
 	LightLock_Unlock(&s_lock);
-	free(text);  // queue full: drop it
+	json_decref(step);  // queue full: drop it
 	LightEvent_Signal(&s_pressEvent);
 }
 
 static json_t *step(const char *type, const char *field, const char *value) {
-	return json_pack("[{s:s,s:s}]", "type", type, field, value);
+	return json_pack("{s:s,s:s}", "type", type, field, value);
 }
 
 void press_key(const PadKey *key) {
@@ -407,20 +414,33 @@ void press_key(const PadKey *key) {
 
 void press_action(const char *actionId) { enqueue(step("action", "id", actionId)); }
 
+// Takes every queued step; NULL when there are none.
+static json_t *take_steps(void) {
+	json_t *steps = NULL;
+	LightLock_Lock(&s_lock);
+	while (s_qHead != s_qTail) {
+		if (!steps) steps = json_array();
+		json_array_append_new(steps, s_queue[s_qHead]);
+		s_qHead = (s_qHead + 1) % QUEUE;
+	}
+	LightLock_Unlock(&s_lock);
+	return steps;
+}
+
 static void press_thread(void *arg) {
 	while (!s_quit) {
 		LightEvent_Wait(&s_pressEvent);
 		for (;;) {
-			LightLock_Lock(&s_lock);
-			char *body = s_qHead != s_qTail ? s_queue[s_qHead] : NULL;
-			if (body) s_qHead = (s_qHead + 1) % QUEUE;
-			LightLock_Unlock(&s_lock);
-			if (!body || s_quit) {
-				free(body);
+			json_t *steps = take_steps();
+			if (!steps || s_quit) {
+				json_decref(steps);
 				break;
 			}
+			json_t *req = json_pack("{s:o}", "steps", steps);
+			char *body = json_dumps(req, JSON_COMPACT);
+			json_decref(req);
 			HttpResponse res;
-			bool sent = request("POST", "/api/run", body, &res, 8000);
+			bool sent = request(&s_pressConn, "POST", "/api/run", body, &res, 8000);
 			free(body);
 			json_t *root = sent ? json_loadb(res.body, res.len, 0, NULL) : NULL;
 			if (!sent) {
@@ -504,7 +524,7 @@ static void icon_thread(void *arg) {
 				char url[200];
 				snprintf(url, sizeof url, "/api/apps/icon?bundleId=%s&size=48", id);
 				HttpResponse res;
-				if (request("GET", url, NULL, &res, TIMEOUT_MS) && res.status == 200) {
+				if (request(NULL, "GET", url, NULL, &res, TIMEOUT_MS) && res.status == 200) {
 					ensure_dirs();
 					FILE *f = fopen(path, "wb");
 					if (f) {
@@ -556,6 +576,8 @@ void macapad_start(void) {
 	s_quit = false;
 	LightEvent_Init(&s_pressEvent, RESET_ONESHOT);
 	LightEvent_Init(&s_iconEvent, RESET_ONESHOT);
+	http_conn_init(&s_statusConn);
+	http_conn_init(&s_pressConn);
 	s_statusThread = spawn(status_thread, NULL);
 	s_pressThread = spawn(press_thread, NULL);
 	s_iconThread = spawn(icon_thread, NULL);
@@ -572,6 +594,10 @@ void macapad_stop(void) {
 		threadJoin(threads[i], U64_MAX);
 		threadFree(threads[i]);
 	}
+	http_conn_close(&s_statusConn);
+	http_conn_close(&s_pressConn);
+	json_t *left = take_steps();
+	json_decref(left);
 	free(s_artPixels);
 	s_artPixels = NULL;
 	s_artFresh = false;
@@ -612,7 +638,7 @@ static void scan_thread(void *arg) {
 	scan->running = false;
 }
 
-static Thread s_scanThread, s_pairThread, s_catalogThread;
+static Thread s_scanThread, s_pairThread;
 
 void scan_start(Scan *scan) {
 	memset(scan, 0, sizeof *scan);
@@ -866,7 +892,7 @@ static void catalog_thread(void *arg) {
 	static const char *paths[] = {"/api/actions", "/api/apps", "/api/shortcuts"};
 	static const char *lists[] = {"actions", "apps", "shortcuts"};
 	HttpResponse res;
-	if (!request("GET", paths[cat->kind], NULL, &res, 8000) || res.status != 200) {
+	if (!request(NULL, "GET", paths[cat->kind], NULL, &res, 8000) || res.status != 200) {
 		copy(cat->error, sizeof cat->error, res.status ? "Your Mac said no." : "Can't reach your Mac.");
 		http_free(&res);
 		cat->done = true;
@@ -886,6 +912,7 @@ static void catalog_thread(void *arg) {
 			copy(c->label, sizeof c->label, jstr(item, "name"));
 			copy(c->sub, sizeof c->sub, jstr(item, "category"));
 			copy(c->value, sizeof c->value, jstr(item, "id"));
+			copy(c->icon, sizeof c->icon, jstr(item, "icon"));
 			break;
 		case CATALOG_APPS:
 			copy(c->label, sizeof c->label, jstr(item, "name"));
@@ -906,21 +933,23 @@ static void catalog_thread(void *arg) {
 }
 
 void catalog_start(Catalog *cat, CatalogKind kind) {
+	catalog_finish(cat);
 	memset(cat, 0, sizeof *cat);
 	cat->kind = kind;
 	cat->running = true;
-	s_catalogThread = spawn(catalog_thread, cat);
+	cat->thread = spawn(catalog_thread, cat);
 }
 
 void catalog_finish(Catalog *cat) {
-	if (s_catalogThread) {
-		threadJoin(s_catalogThread, U64_MAX);
-		threadFree(s_catalogThread);
-		s_catalogThread = NULL;
+	if (cat->thread) {
+		threadJoin(cat->thread, U64_MAX);
+		threadFree(cat->thread);
+		cat->thread = NULL;
 	}
 	free(cat->items);
 	cat->items = NULL;
 	cat->count = 0;
+	cat->running = cat->done = false;
 }
 
 // ---- PNG ---------------------------------------------------------------------------

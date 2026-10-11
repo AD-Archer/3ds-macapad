@@ -23,6 +23,7 @@
 #define C_YELLOW    C2D_Color32(0xFF, 0xD6, 0x0A, 0xFF)
 #define C_TEAL      C2D_Color32(0x64, 0xD2, 0xFF, 0xFF)
 #define C_PINK      C2D_Color32(0xFF, 0x37, 0x5F, 0xFF)
+#define C_GRAY      C2D_Color32(0x8E, 0x8E, 0x93, 0xFF)
 
 void gfx_init(void);
 void gfx_exit(void);
@@ -31,6 +32,10 @@ void gfx_frame(void);  // clears the text buffer; call once per frame
 void disc(float cx, float cy, float r, u32 color);
 void ellipse(float x, float y, float w, float h, u32 color);
 void rrect(float x, float y, float w, float h, float r, u32 color);
+// Outlines, t px thick, drawn inside the shape.
+void ring(float cx, float cy, float r, float t, u32 color);
+void stroke_arc(float cx, float cy, float rx, float ry, float from, float to, float t, u32 color);
+void stroke_rrect(float x, float y, float w, float h, float r, float t, u32 color);
 
 // Text at (x, y) = top-left, or top-center / top-right with C2D_AlignCenter / C2D_AlignRight.
 void text(float x, float y, float scale, u32 color, int align, const char *str);
@@ -38,12 +43,26 @@ void text(float x, float y, float scale, u32 color, int align, const char *str);
 void text_fit(float x, float y, float scale, u32 color, int align, float maxw, const char *str);
 float text_width(const char *str, float scale);
 
-// Little drawn icons for media keys, centered on (cx, cy), about size px tall.
+// Little drawn icons, centered on (cx, cy), about size px tall. bg is what's behind the icon,
+// for the few that have gaps (a keyhole, the front window of a stack).
 typedef enum {
+	GLYPH_NONE,
+	// media
 	GLYPH_PLAY, GLYPH_PAUSE, GLYPH_PLAYPAUSE, GLYPH_NEXT, GLYPH_PREV,
-	GLYPH_VOL_UP, GLYPH_VOL_DOWN, GLYPH_MUTE, GLYPH_PLUS, GLYPH_GLOBE, GLYPH_KEYS, GLYPH_BOLT,
+	GLYPH_VOL_UP, GLYPH_VOL_DOWN, GLYPH_MUTE,
+	// system
+	GLYPH_SMILE, GLYPH_SEARCH, GLYPH_CAMERA, GLYPH_CROP, GLYPH_MONITOR, GLYPH_GRID, GLYPH_WINDOWS, GLYPH_LOCK,
+	// windows
+	GLYPH_MINIMIZE, GLYPH_EXPAND, GLYPH_CLOSE, GLYPH_REFRESH, GLYPH_MINUS_CIRCLE, GLYPH_POWER,
+	// browser
+	GLYPH_TAB, GLYPH_UNDO, GLYPH_REDO, GLYPH_ARROW_RIGHT, GLYPH_ARROW_LEFT, GLYPH_ADDRESS,
+	// editing
+	GLYPH_COPY, GLYPH_PASTE, GLYPH_CUT, GLYPH_SELECT_ALL, GLYPH_SAVE,
+	// key kinds + UI
+	GLYPH_BOLT, GLYPH_GLOBE, GLYPH_KEYS, GLYPH_SHORTCUT, GLYPH_APP,
+	GLYPH_PLUS, GLYPH_CHECK, GLYPH_CHEVRON_R, GLYPH_CHEVRON_L, GLYPH_CLOCK, GLYPH_LAPTOP, GLYPH_PENCIL, GLYPH_TRASH,
 } Glyph;
-void glyph(Glyph g, float cx, float cy, float size, u32 color);
+void glyph(Glyph g, float cx, float cy, float size, u32 color, u32 bg);
 
 // A texture made from RGBA8 pixels (up to 256x256).
 typedef struct {

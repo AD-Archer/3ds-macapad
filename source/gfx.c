@@ -39,6 +39,40 @@ void rrect(float x, float y, float w, float h, float r, u32 c) {
 	arc(x + r, y + h - r, r, r, 0.5f * M_PI, M_PI, c);
 }
 
+void ring(float cx, float cy, float r, float t, u32 c) { stroke_arc(cx, cy, r, r, 0, 2 * M_PI, t, c); }
+
+// A band between radius (rx, ry) and (rx - t, ry - t), as a strip of triangles.
+void stroke_arc(float cx, float cy, float rx, float ry, float from, float to, float t, u32 c) {
+	int n = (int)((rx > ry ? rx : ry) * (to - from) / 2.0f) + 3;
+	if (n > 64) n = 64;
+	float irx = rx - t, iry = ry - t;
+	if (irx < 0) irx = 0;
+	if (iry < 0) iry = 0;
+	float ox = cx + rx * cosf(from), oy = cy + ry * sinf(from);
+	float ix = cx + irx * cosf(from), iy = cy + iry * sinf(from);
+	for (int i = 1; i <= n; i++) {
+		float a = from + (to - from) * i / n;
+		float qox = cx + rx * cosf(a), qoy = cy + ry * sinf(a);
+		float qix = cx + irx * cosf(a), qiy = cy + iry * sinf(a);
+		C2D_DrawTriangle(ox, oy, c, ix, iy, c, qox, qoy, c, 0.5f);
+		C2D_DrawTriangle(ix, iy, c, qix, qiy, c, qox, qoy, c, 0.5f);
+		ox = qox; oy = qoy; ix = qix; iy = qiy;
+	}
+}
+
+void stroke_rrect(float x, float y, float w, float h, float r, float t, u32 c) {
+	if (r * 2 > h) r = h / 2;
+	if (r * 2 > w) r = w / 2;
+	C2D_DrawRectSolid(x + r, y, 0.5f, w - 2 * r, t, c);
+	C2D_DrawRectSolid(x + r, y + h - t, 0.5f, w - 2 * r, t, c);
+	C2D_DrawRectSolid(x, y + r, 0.5f, t, h - 2 * r, c);
+	C2D_DrawRectSolid(x + w - t, y + r, 0.5f, t, h - 2 * r, c);
+	stroke_arc(x + r, y + r, r, r, M_PI, 1.5f * M_PI, t, c);
+	stroke_arc(x + w - r, y + r, r, r, 1.5f * M_PI, 2 * M_PI, t, c);
+	stroke_arc(x + w - r, y + h - r, r, r, 0, 0.5f * M_PI, t, c);
+	stroke_arc(x + r, y + h - r, r, r, 0.5f * M_PI, M_PI, t, c);
+}
+
 void text(float x, float y, float scale, u32 color, int align, const char *str) {
 	if (!str || !*str) return;
 	C2D_Text t;
@@ -116,9 +150,41 @@ static void speaker(float cx, float cy, float s, u32 c) {
 	C2D_DrawTriangle(x + s * 0.1f, cy, c, x + s * 0.5f, cy - s * 0.45f, c, x + s * 0.5f, cy + s * 0.45f, c, 0.5f);
 }
 
-void glyph(Glyph g, float cx, float cy, float s, u32 c) {
-	float bar = s * 0.12f;
+static void line(float x1, float y1, float x2, float y2, float t, u32 c) {
+	C2D_DrawLine(x1, y1, c, x2, y2, c, t, 0.5f);
+}
+
+static void quad(float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4, u32 c) {
+	C2D_DrawTriangle(x1, y1, c, x2, y2, c, x3, y3, c, 0.5f);
+	C2D_DrawTriangle(x1, y1, c, x3, y3, c, x4, y4, c, 0.5f);
+}
+
+// An arrowhead with its tip at (x, y), pointing along (dx, dy) (a unit vector), s px long.
+static void arrow_head(float x, float y, float dx, float dy, float s, u32 c) {
+	float bx = x - dx * s, by = y - dy * s;  // middle of the base
+	float nx = -dy * s * 0.6f, ny = dx * s * 0.6f;
+	C2D_DrawTriangle(x, y, c, bx + nx, by + ny, c, bx - nx, by - ny, c, 0.5f);
+}
+
+// A right-pointing arrow with a shaft, cy across the middle, from x0 to x1 (x1 is the tip).
+static void arrow(float x0, float x1, float cy, float s, float t, u32 c) {
+	float dir = x1 > x0 ? 1 : -1;
+	line(x0, cy, x1 - dir * s * 0.3f, cy, t, c);
+	arrow_head(x1, cy, dir, 0, s * 0.42f, c);
+}
+
+// A window: a rounded rect with a title bar, drawn solid in c with a 1.5px bg border so it reads on a stack.
+static void window(float x, float y, float w, float h, u32 c, u32 bg, bool border) {
+	if (border) rrect(x - 1.5f, y - 1.5f, w + 3, h + 3, 3.5f, bg);
+	rrect(x, y, w, h, 2.5f, c);
+	C2D_DrawRectSolid(x + 1.5f, y + h * 0.3f, 0.5f, w - 3, 1.2f, bg);
+}
+
+void glyph(Glyph g, float cx, float cy, float s, u32 c, u32 bg) {
+	float bar = s * 0.12f, t = s * 0.14f;
 	switch (g) {
+	case GLYPH_NONE:
+		break;
 	case GLYPH_PLAY:
 		tri_right(cx - s * 0.32f, cy, s, c);
 		break;
@@ -153,33 +219,232 @@ void glyph(Glyph g, float cx, float cy, float s, u32 c) {
 	case GLYPH_MUTE: {
 		speaker(cx - s * 0.1f, cy, s, c);
 		float x = cx + s * 0.4f, d = s * 0.18f;
-		C2D_DrawLine(x - d, cy - d, c, x + d, cy + d, c, bar, 0.5f);
-		C2D_DrawLine(x - d, cy + d, c, x + d, cy - d, c, bar, 0.5f);
+		line(x - d, cy - d, x + d, cy + d, bar, c);
+		line(x - d, cy + d, x + d, cy - d, bar, c);
 		break;
 	}
-	case GLYPH_PLUS:
-		C2D_DrawRectSolid(cx - s / 2, cy - bar / 2, 0.5f, s, bar, c);
-		C2D_DrawRectSolid(cx - bar / 2, cy - s / 2, 0.5f, bar, s, c);
+
+	// ---- system ----
+	case GLYPH_SMILE:
+		ring(cx, cy, s / 2, t, c);
+		disc(cx - s * 0.17f, cy - s * 0.12f, s * 0.07f, c);
+		disc(cx + s * 0.17f, cy - s * 0.12f, s * 0.07f, c);
+		stroke_arc(cx, cy + s * 0.02f, s * 0.28f, s * 0.26f, 0.2f * M_PI, 0.8f * M_PI, t * 0.8f, c);
+		break;
+	case GLYPH_SEARCH:
+		ring(cx - s * 0.1f, cy - s * 0.1f, s * 0.32f, t, c);
+		line(cx + s * 0.14f, cy + s * 0.14f, cx + s * 0.44f, cy + s * 0.44f, t * 1.2f, c);
+		break;
+	case GLYPH_CAMERA:
+		C2D_DrawRectSolid(cx - s * 0.18f, cy - s * 0.42f, 0.5f, s * 0.36f, s * 0.16f, c);
+		stroke_rrect(cx - s * 0.5f, cy - s * 0.3f, s, s * 0.7f, s * 0.12f, t * 0.8f, c);
+		ring(cx, cy + s * 0.05f, s * 0.18f, t * 0.8f, c);
+		break;
+	case GLYPH_CROP: {
+		float a = s * 0.45f, l = s * 0.26f, w = t * 0.85f;
+		for (int i = 0; i < 4; i++) {
+			float sx = i & 1 ? 1 : -1, sy = i & 2 ? 1 : -1;
+			float x = cx + sx * a, y = cy + sy * a;
+			C2D_DrawRectSolid(sx > 0 ? x - l : x, y - (sy > 0 ? w : 0), 0.5f, l, w, c);
+			C2D_DrawRectSolid(x - (sx > 0 ? w : 0), sy > 0 ? y - l : y, 0.5f, w, l, c);
+		}
+		disc(cx, cy, s * 0.1f, c);
+		break;
+	}
+	case GLYPH_MONITOR:
+		stroke_rrect(cx - s * 0.5f, cy - s * 0.42f, s, s * 0.66f, s * 0.08f, t * 0.8f, c);
+		C2D_DrawRectSolid(cx - t / 2, cy + s * 0.24f, 0.5f, t, s * 0.14f, c);
+		rrect(cx - s * 0.24f, cy + s * 0.36f, s * 0.48f, t * 0.8f, 1.5f, c);
+		break;
+	case GLYPH_GRID: {
+		float b = s * 0.42f, gap = s * 0.14f, x0 = cx - b - gap / 2, y0 = cy - b - gap / 2;
+		for (int i = 0; i < 4; i++) rrect(x0 + (i & 1) * (b + gap), y0 + (i >> 1) * (b + gap), b, b, s * 0.08f, c);
+		break;
+	}
+	case GLYPH_WINDOWS:
+		window(cx - s * 0.5f, cy - s * 0.45f, s * 0.78f, s * 0.62f, c, bg, false);
+		window(cx - s * 0.26f, cy - s * 0.15f, s * 0.78f, s * 0.62f, c, bg, true);
+		break;
+	case GLYPH_LOCK:
+		stroke_arc(cx, cy - s * 0.14f, s * 0.24f, s * 0.26f, M_PI, 2 * M_PI, t * 0.85f, c);
+		C2D_DrawRectSolid(cx - s * 0.24f, cy - s * 0.14f, 0.5f, t * 0.85f, s * 0.1f, c);
+		C2D_DrawRectSolid(cx + s * 0.24f - t * 0.85f, cy - s * 0.14f, 0.5f, t * 0.85f, s * 0.1f, c);
+		rrect(cx - s * 0.4f, cy - s * 0.06f, s * 0.8f, s * 0.56f, s * 0.1f, c);
+		disc(cx, cy + s * 0.2f, s * 0.07f, bg);
+		break;
+
+	// ---- windows ----
+	case GLYPH_MINIMIZE:
+		line(cx, cy - s * 0.48f, cx, cy + s * 0.02f, t, c);
+		arrow_head(cx, cy + s * 0.2f, 0, 1, s * 0.4f, c);
+		rrect(cx - s * 0.42f, cy + s * 0.36f, s * 0.84f, t, 1.5f, c);
+		break;
+	case GLYPH_EXPAND: {
+		float a = s * 0.42f, l = s * 0.3f, w = t * 0.9f;
+		// top-right and bottom-left corners, with a diagonal between
+		C2D_DrawRectSolid(cx + a - l, cy - a, 0.5f, l, w, c);
+		C2D_DrawRectSolid(cx + a - w, cy - a, 0.5f, w, l, c);
+		C2D_DrawRectSolid(cx - a, cy + a - w, 0.5f, l, w, c);
+		C2D_DrawRectSolid(cx - a, cy + a - l, 0.5f, w, l, c);
+		line(cx - a + w, cy + a - w, cx + a - w, cy - a + w, w, c);
+		break;
+	}
+	case GLYPH_CLOSE: {
+		ring(cx, cy, s / 2, t, c);
+		float d = s * 0.17f;
+		line(cx - d, cy - d, cx + d, cy + d, t * 0.85f, c);
+		line(cx - d, cy + d, cx + d, cy - d, t * 0.85f, c);
+		break;
+	}
+	case GLYPH_REFRESH: {
+		float r = s * 0.4f, to = 4.3f;
+		stroke_arc(cx, cy, r, r, -0.9f, to, t, c);
+		float ex = cx + (r - t / 2) * cosf(to), ey = cy + (r - t / 2) * sinf(to);
+		arrow_head(ex - sinf(to) * s * 0.1f, ey + cosf(to) * s * 0.1f, -sinf(to), cosf(to), s * 0.36f, c);
+		break;
+	}
+	case GLYPH_MINUS_CIRCLE:
+		ring(cx, cy, s / 2, t, c);
+		rrect(cx - s * 0.24f, cy - t * 0.42f, s * 0.48f, t * 0.85f, 1, c);
+		break;
+	case GLYPH_POWER:
+		stroke_arc(cx, cy + s * 0.04f, s * 0.42f, s * 0.42f, -M_PI / 2 + 0.7f, 1.5f * M_PI - 0.7f, t, c);
+		rrect(cx - t / 2, cy - s * 0.5f, t, s * 0.48f, t / 2, c);
+		break;
+
+	// ---- browser ----
+	case GLYPH_TAB:
+		rrect(cx - s * 0.5f, cy - s * 0.46f, s * 0.44f, s * 0.3f, s * 0.08f, c);
+		rrect(cx - s * 0.5f, cy - s * 0.28f, s, s * 0.74f, s * 0.1f, c);
+		C2D_DrawRectSolid(cx - s * 0.2f, cy + s * 0.08f - bar * 0.4f, 0.5f, s * 0.4f, bar * 0.8f, bg);
+		C2D_DrawRectSolid(cx - bar * 0.4f, cy + s * 0.08f - s * 0.2f, 0.5f, bar * 0.8f, s * 0.4f, bg);
+		break;
+	case GLYPH_UNDO:
+	case GLYPH_REDO: {
+		float m = g == GLYPH_UNDO ? 1 : -1, r = s * 0.3f;
+		float ax = cx + m * s * 0.1f, ay = cy + s * 0.08f;
+		// the curve on the far side, then a straight run back toward the arrow
+		if (m > 0) stroke_arc(ax, ay, r, r, -M_PI / 2, M_PI / 2, t, c);
+		else stroke_arc(ax, ay, r, r, M_PI / 2, 1.5f * M_PI, t, c);
+		line(ax, ay - r + t / 2, ax - m * s * 0.3f, ay - r + t / 2, t, c);
+		line(ax, ay + r - t / 2, ax - m * s * 0.22f, ay + r - t / 2, t, c);
+		arrow_head(ax - m * s * 0.5f, ay - r + t / 2, -m, 0, s * 0.36f, c);
+		break;
+	}
+	case GLYPH_ARROW_RIGHT:
+		arrow(cx - s * 0.45f, cx + s * 0.48f, cy, s, t, c);
+		break;
+	case GLYPH_ARROW_LEFT:
+		arrow(cx + s * 0.45f, cx - s * 0.48f, cy, s, t, c);
+		break;
+	case GLYPH_ADDRESS:
+		stroke_rrect(cx - s * 0.62f, cy - s * 0.26f, s * 1.24f, s * 0.52f, s * 0.26f, t * 0.75f, c);
+		disc(cx - s * 0.34f, cy, s * 0.07f, c);
+		rrect(cx - s * 0.18f, cy - t * 0.3f, s * 0.5f, t * 0.6f, 1, c);
+		break;
+
+	// ---- editing ----
+	case GLYPH_COPY:
+		stroke_rrect(cx - s * 0.46f, cy - s * 0.5f, s * 0.64f, s * 0.74f, s * 0.08f, t * 0.75f, c);
+		rrect(cx - s * 0.2f - 1.5f, cy - s * 0.26f - 1.5f, s * 0.64f + 3, s * 0.74f + 3, s * 0.1f, bg);
+		rrect(cx - s * 0.2f, cy - s * 0.26f, s * 0.64f, s * 0.74f, s * 0.08f, c);
+		break;
+	case GLYPH_PASTE:
+		rrect(cx - s * 0.4f, cy - s * 0.38f, s * 0.8f, s * 0.88f, s * 0.08f, c);
+		rrect(cx - s * 0.2f, cy - s * 0.5f, s * 0.4f, s * 0.22f, s * 0.05f, c);
+		C2D_DrawRectSolid(cx - s * 0.24f, cy - s * 0.02f, 0.5f, s * 0.48f, t * 0.55f, bg);
+		C2D_DrawRectSolid(cx - s * 0.24f, cy + s * 0.18f, 0.5f, s * 0.32f, t * 0.55f, bg);
+		break;
+	case GLYPH_CUT:
+		ring(cx - s * 0.26f, cy + s * 0.3f, s * 0.17f, t * 0.8f, c);
+		ring(cx + s * 0.26f, cy + s * 0.3f, s * 0.17f, t * 0.8f, c);
+		line(cx - s * 0.14f, cy + s * 0.16f, cx + s * 0.32f, cy - s * 0.5f, t * 0.85f, c);
+		line(cx + s * 0.14f, cy + s * 0.16f, cx - s * 0.32f, cy - s * 0.5f, t * 0.85f, c);
+		break;
+	case GLYPH_SELECT_ALL: {
+		float a = s * 0.44f, d = s * 0.22f, w = t * 0.7f;
+		for (int i = 0; i < 3; i++) {
+			float o = -a + i * (2 * a - d) / 2;
+			C2D_DrawRectSolid(cx + o, cy - a, 0.5f, d, w, c);
+			C2D_DrawRectSolid(cx + o, cy + a - w, 0.5f, d, w, c);
+			C2D_DrawRectSolid(cx - a, cy + o, 0.5f, w, d, c);
+			C2D_DrawRectSolid(cx + a - w, cy + o, 0.5f, w, d, c);
+		}
+		rrect(cx - s * 0.18f, cy - s * 0.18f, s * 0.36f, s * 0.36f, 1.5f, c);
+		break;
+	}
+	case GLYPH_SAVE:
+		rrect(cx - s * 0.44f, cy - s * 0.44f, s * 0.88f, s * 0.88f, s * 0.1f, c);
+		C2D_DrawRectSolid(cx - s * 0.24f, cy - s * 0.44f, 0.5f, s * 0.48f, s * 0.26f, bg);
+		C2D_DrawRectSolid(cx + s * 0.06f, cy - s * 0.4f, 0.5f, s * 0.1f, s * 0.16f, c);
+		rrect(cx - s * 0.26f, cy + s * 0.1f, s * 0.52f, s * 0.26f, s * 0.04f, bg);
+		break;
+
+	// ---- key kinds + UI ----
+	case GLYPH_BOLT:
+		quad(cx + s * 0.2f, cy - s * 0.5f, cx - s * 0.3f, cy + s * 0.05f, cx, cy + s * 0.05f, cx + s * 0.1f, cy - s * 0.08f, c);
+		quad(cx, cy + s * 0.05f, cx - s * 0.15f, cy + s * 0.5f, cx + s * 0.3f, cy - s * 0.08f, cx + s * 0.1f, cy - s * 0.08f, c);
 		break;
 	case GLYPH_GLOBE: {
-		float r = s / 2, t = bar * 0.7f;
-		disc(cx, cy, r, c);
-		disc(cx, cy, r - t, C_CARD);
-		ellipse(cx - r * 0.45f, cy - r, r * 0.9f, r * 2, c);
-		ellipse(cx - r * 0.45f + t, cy - r + t, r * 0.9f - 2 * t, r * 2 - 2 * t, C_CARD);
-		C2D_DrawRectSolid(cx - r, cy - t / 2, 0.5f, r * 2, t, c);
+		float r = s / 2, w = t * 0.7f;
+		ring(cx, cy, r, w, c);
+		stroke_arc(cx, cy, r * 0.45f, r, 0, 2 * M_PI, w, c);
+		C2D_DrawRectSolid(cx - r, cy - w / 2, 0.5f, r * 2, w, c);
 		break;
 	}
 	case GLYPH_KEYS:
-		rrect(cx - s * 0.6f, cy - s * 0.38f, s * 1.2f, s * 0.76f, 3, c);
+		stroke_rrect(cx - s * 0.6f, cy - s * 0.38f, s * 1.2f, s * 0.76f, 3, t * 0.7f, c);
 		for (int row = 0; row < 2; row++)
 			for (int col = 0; col < 4; col++)
-				C2D_DrawRectSolid(cx - s * 0.48f + col * s * 0.26f, cy - s * 0.26f + row * s * 0.22f, 0.5f, s * 0.16f, s * 0.13f, C_CARD);
-		C2D_DrawRectSolid(cx - s * 0.3f, cy + s * 0.18f, 0.5f, s * 0.6f, s * 0.1f, C_CARD);
+				C2D_DrawRectSolid(cx - s * 0.44f + col * s * 0.24f, cy - s * 0.22f + row * s * 0.18f, 0.5f, s * 0.14f, s * 0.11f, c);
+		C2D_DrawRectSolid(cx - s * 0.3f, cy + s * 0.14f, 0.5f, s * 0.6f, s * 0.1f, c);
 		break;
-	case GLYPH_BOLT:
-		C2D_DrawTriangle(cx + s * 0.15f, cy - s / 2, c, cx - s * 0.35f, cy + s * 0.08f, c, cx + s * 0.05f, cy + s * 0.08f, c, 0.5f);
-		C2D_DrawTriangle(cx - s * 0.15f, cy + s / 2, c, cx + s * 0.35f, cy - s * 0.08f, c, cx - s * 0.05f, cy - s * 0.08f, c, 0.5f);
+	case GLYPH_SHORTCUT:
+		rrect(cx - s * 0.5f, cy - s * 0.5f, s * 0.74f, s * 0.74f, s * 0.18f, c);
+		rrect(cx - s * 0.24f - 1.5f, cy - s * 0.24f - 1.5f, s * 0.74f + 3, s * 0.74f + 3, s * 0.2f, bg);
+		rrect(cx - s * 0.24f, cy - s * 0.24f, s * 0.74f, s * 0.74f, s * 0.18f, c);
+		break;
+	case GLYPH_APP:
+		rrect(cx - s * 0.5f, cy - s * 0.5f, s, s, s * 0.22f, c);
+		disc(cx - s * 0.2f, cy - s * 0.2f, s * 0.1f, bg);
+		disc(cx + s * 0.2f, cy - s * 0.2f, s * 0.1f, bg);
+		disc(cx - s * 0.2f, cy + s * 0.2f, s * 0.1f, bg);
+		disc(cx + s * 0.2f, cy + s * 0.2f, s * 0.1f, bg);
+		break;
+	case GLYPH_PLUS:
+		rrect(cx - s / 2, cy - bar / 2, s, bar, bar / 2, c);
+		rrect(cx - bar / 2, cy - s / 2, bar, s, bar / 2, c);
+		break;
+	case GLYPH_CHECK:
+		line(cx - s * 0.42f, cy + s * 0.02f, cx - s * 0.14f, cy + s * 0.3f, t * 1.1f, c);
+		line(cx - s * 0.14f, cy + s * 0.3f, cx + s * 0.44f, cy - s * 0.3f, t * 1.1f, c);
+		break;
+	case GLYPH_CHEVRON_R:
+	case GLYPH_CHEVRON_L: {
+		float m = g == GLYPH_CHEVRON_R ? 1 : -1;
+		line(cx - m * s * 0.14f, cy - s * 0.36f, cx + m * s * 0.16f, cy, t * 0.9f, c);
+		line(cx + m * s * 0.16f, cy, cx - m * s * 0.14f, cy + s * 0.36f, t * 0.9f, c);
+		break;
+	}
+	case GLYPH_CLOCK:
+		ring(cx, cy, s / 2, t, c);
+		rrect(cx - t * 0.4f, cy - s * 0.3f, t * 0.8f, s * 0.3f + t * 0.4f, 1, c);
+		rrect(cx - t * 0.4f, cy - t * 0.4f, s * 0.24f, t * 0.8f, 1, c);
+		break;
+	case GLYPH_LAPTOP:
+		stroke_rrect(cx - s * 0.4f, cy - s * 0.42f, s * 0.8f, s * 0.56f, s * 0.06f, t * 0.8f, c);
+		rrect(cx - s * 0.58f, cy + s * 0.2f, s * 1.16f, t, t / 2, c);
+		break;
+	case GLYPH_PENCIL:
+		line(cx - s * 0.22f, cy + s * 0.22f, cx + s * 0.4f, cy - s * 0.4f, s * 0.24f, c);
+		C2D_DrawTriangle(cx - s * 0.46f, cy + s * 0.46f, c, cx - s * 0.38f, cy + s * 0.16f, c, cx - s * 0.16f, cy + s * 0.38f, c, 0.5f);
+		break;
+	case GLYPH_TRASH:
+		rrect(cx - s * 0.46f, cy - s * 0.4f, s * 0.92f, t * 0.8f, 1.5f, c);
+		C2D_DrawRectSolid(cx - s * 0.16f, cy - s * 0.5f, 0.5f, s * 0.32f, t * 0.8f, c);
+		rrect(cx - s * 0.36f, cy - s * 0.26f, s * 0.72f, s * 0.76f, s * 0.08f, c);
+		C2D_DrawRectSolid(cx - s * 0.14f, cy - s * 0.12f, 0.5f, t * 0.5f, s * 0.46f, bg);
+		C2D_DrawRectSolid(cx + s * 0.07f, cy - s * 0.12f, 0.5f, t * 0.5f, s * 0.46f, bg);
 		break;
 	}
 }

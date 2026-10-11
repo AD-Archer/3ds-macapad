@@ -2,8 +2,8 @@
 
 A [Macapad](https://github.com/ad-archer/macapad) frontend for the Nintendo 3DS.
 
-- **Top screen:** the time (from the Mac's clock), the weather where the Mac is, what's playing on the Mac (any app) with artwork and progress, and
-  CPU, memory, battery and disk.
+- **Top screen:** the time (from the Mac's clock), the weather where the Mac is, what's playing on the Mac (any app) with artwork, progress and
+  whether it's playing (bouncing bars) or paused, and CPU, memory, battery and disk.
 - **Bottom screen:** a 4×3 pad of keys, in pages. A key can run a Mac action, open an app (with its icon), open a
   website, press a keyboard shortcut or run a Shortcut.
 
@@ -62,17 +62,23 @@ fetches pinned makerom and bannertool builds and packs `macapad.elf` + `macapad.
    **Or scan the code instead:** on the Mac, choose **Pair with QR Code…** from Macapad's menu bar icon. On the 3DS,
    tap **Scan code** and point the camera on the back at it, about a foot away. It pairs right away, with nothing to
    approve on the Mac, and works even when the scan can't find the Mac.
-3. **Press keys.** Tap a key to run it. Tap an empty slot, or hold any key, to change it.
+3. **Press keys.** Tap a key to run it. Swipe the pad left or right, or tap **‹** / **›** in its corners, to change
+   pages; tap the page's name for the menu. Tap an empty slot, or hold any key, to change it. The search field at
+   the top of "New key" (or the magnifier in the title bar, or **Y**) looks through Mac actions, apps and Shortcuts
+   at once; each picker has the same field for searching just itself.
+
+Taps go to the Mac in order, and any made while one is still on its way go together in the next request, so a quick
+run of taps doesn't wait a round trip each.
 
 | Button | Does |
 |---|
-| L / R | previous / next page |
+| L / R | previous / next page (or swipe, or tap ‹ ›) |
 | X | play / pause |
 | D-pad ← → | previous / next track |
 | D-pad ↑ ↓ | volume |
 | Y | mute |
 | SELECT | edit mode (tap any key to change it) |
-| START | menu: edit keys, add / rename / remove pages, 12/24-hour clock, forget this Mac, quit |
+| START | menu: pages (jump to, add, rename, remove), edit keys, 12/24-hour clock, forget this Mac, quit |
 
 If the Mac's address changes, the 3DS looks for the same Mac on the network again after a few failed polls.
 
@@ -81,18 +87,20 @@ If the Mac's address changes, the 3DS looks for the same Mac on the network agai
 `sd:/3ds/macapad/`:
 
 - `config.json`: the Mac's address, this 3DS's device token, clock setting
-- `pads.json`: your pages and keys. Each key is `{kind, label, ref, category?}`, where `kind` is `action`, `app`,
+- `pads.json`: your pages and keys. Each key is `{kind, label, ref, category?, icon?}`, where `kind` is `action`, `app`,
   `web`, `keys` or `shortcut` and `ref` is the action id, bundle id, URL, key combo (`cmd+shift+t`) or Shortcut name.
+  `icon` is the Material Symbols name the Mac suggests for an action, which the 3DS draws when it has a matching
+  glyph (built-in actions are drawn by id).
 - `icons/<bundleId>.png`: app icons, cached
 
 ## Code
 
 | File | What |
 |---|
-| `source/main.c` | screens: find, pair, dashboard + pad, key editor, lists, menu |
-| `source/macapad.c` | config and pads on the SD card, status / press / icon threads, scanning, pairing, catalog |
-| `source/http.c` | a small HTTP/1.1 client on the 3DS socket API, plus the subnet scan |
-| `source/gfx.c` | rounded rects, circles as triangle fans, text that fits, media glyphs, PNG → texture, camera preview |
+| `source/main.c` | screens: find, pair, dashboard + pad (with page swipes), key editor, grouped lists, menu |
+| `source/macapad.c` | config and pads on the SD card, status / press / icon threads (presses batched, connections kept open), scanning, pairing, catalog |
+| `source/http.c` | a small HTTP/1.1 client on the 3DS socket API, with keep-alive and Content-Length framing, plus the subnet scan |
+| `source/gfx.c` | rounded rects, circles as triangle fans, outlines, text that fits, the icon set, PNG → texture, camera preview |
 | `source/qrscan.c` | the outer camera at 640×480: a capture thread and a QR-decoding thread, for pairing |
 | `source/quirc/` | [quirc](https://github.com/dlbeer/quirc) v1.2, the QR decoder (ISC license, see its `LICENSE`) |
 

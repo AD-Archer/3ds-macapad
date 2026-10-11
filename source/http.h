@@ -9,10 +9,25 @@ typedef struct {
 	size_t len;
 } HttpResponse;
 
+// A connection kept open between requests to one Mac (HTTP keep-alive), so a thread that
+// talks to it often skips the TCP handshake each time. One per thread; never shared.
+typedef struct {
+	int fd;
+	char host[64];
+	int port;
+} HttpConn;
+
+void http_conn_init(HttpConn *conn);
+void http_conn_close(HttpConn *conn);
+
 // One request over a fresh connection (Connection: close). token and body may be NULL.
 // Returns false when nothing came back at all.
 bool http_request(const char *method, const char *host, int port, const char *path,
                   const char *token, const char *body, HttpResponse *out, int timeout_ms);
+// The same over conn, which stays open afterwards when the Mac allows it. If the Mac had
+// dropped the idle connection, this notices and tries once more on a new one.
+bool http_request_on(HttpConn *conn, const char *method, const char *host, int port, const char *path,
+                     const char *token, const char *body, HttpResponse *out, int timeout_ms);
 void http_free(HttpResponse *res);
 
 // "http://192.168.1.5:7317" -> host + port. Port defaults to 7317.

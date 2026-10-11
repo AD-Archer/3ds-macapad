@@ -25,6 +25,7 @@ typedef struct {
 	char label[48];
 	char ref[192];      // action id, bundle id, url, key combo or shortcut name
 	char category[16];  // actions only: media, system, windows, browser, editing, custom
+	char icon[24];      // actions only: the Material Symbols name the Mac suggests, for custom actions
 } PadKey;
 
 typedef struct {
@@ -157,6 +158,7 @@ typedef struct {
 	char label[64];
 	char sub[32];
 	char value[192];
+	char icon[24];
 } CatalogItem;
 
 typedef enum { CATALOG_ACTIONS, CATALOG_APPS, CATALOG_SHORTCUTS } CatalogKind;
@@ -168,10 +170,12 @@ typedef struct {
 	char error[96];
 	int count;
 	CatalogItem *items;
+	Thread thread;
 } Catalog;
 
+// Each catalog fetches on its own thread, so several can load at once.
 void catalog_start(Catalog *cat, CatalogKind kind);
-void catalog_finish(Catalog *cat);  // joins and frees the items
+void catalog_finish(Catalog *cat);  // joins and frees the items; fine on one never started
 
 // ---- app icons ---------------------------------------------------------------
 
