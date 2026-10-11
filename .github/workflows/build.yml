@@ -83,6 +83,9 @@ jobs:
       TAG: v${{ needs.version.outputs.version }}
       CIA_URL: https://github.com/${{ github.repository }}/releases/latest/download/macapad.cia
     steps:
+      # checkout first: it empties the directory, which would take the downloaded builds with it
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: macapad
@@ -90,7 +93,21 @@ jobs:
       - name: Make the QR code
         run: |
           sudo apt-get install -y -qq qrencode >/dev/null
-          qrencode -s 8 -m 2 -o macapad-qr.png "$CIA_URL"
+          qrencode -s 8 -m 2 -o cia/qr.png "$CIA_URL"
+          cp cia/qr.png macapad-qr.png
+
+      # The README and docs show cia/qr.png, so keep the committed copy in step with the URL
+      # (it only changes if the repo is renamed or moved). Pushes made with github.token don't
+      # start another run.
+      - name: Commit the QR code if it changed
+        run: |
+          if git diff --quiet -- cia/qr.png; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add cia/qr.png
+          git commit -m "Update the FBI QR code [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
 
       - name: Publish
         env:
