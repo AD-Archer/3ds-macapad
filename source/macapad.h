@@ -49,6 +49,41 @@ void pads_load(void);
 void pads_save(void);
 const char *kind_name(KeyKind kind);
 
+// ---- the 3DS as a controller (saved too) ------------------------------------------
+
+// Every button and stick that can be given a job, in the order they're listed.
+typedef enum {
+	CTL_A, CTL_B, CTL_X, CTL_Y, CTL_L, CTL_R, CTL_ZL, CTL_ZR,
+	CTL_UP, CTL_DOWN, CTL_LEFT, CTL_RIGHT, CTL_START, CTL_SELECT,
+	CTL_CIRCLE, CTL_CSTICK,
+	CTL_COUNT
+} Control;
+
+#define PRESETS 3  // Mouse & keys, Retro games, PC games
+
+// What a control does. A button: a key or keys held together ("x", "cmd+tab"), a mouse button
+// ("click:left", "click:right", "click:middle") or "none". A stick: "pointer", "scroll", "arrows",
+// "wasd" or "none".
+typedef struct {
+	int preset;
+	char changes[PRESETS][CTL_COUNT][24];  // what's been changed in each preset; "" = as the preset has it
+} Controller;
+
+extern Controller g_controller;
+
+void controller_load(void);
+void controller_save(void);
+const char *preset_name(int preset);
+const char *preset_about(int preset);
+// The preset's own job for c, and what it's for in a game ("Jump"), or "".
+const char *preset_binding(int preset, Control c);
+const char *preset_note(int preset, Control c);
+// What c does now: the change, else the preset's.
+const char *control_binding(Control c);
+// Sets what c does in the current preset ("" = back to the preset's).
+void control_set(Control c, const char *binding);
+int preset_changes(int preset);
+
 // ---- live status (filled by the status thread) ------------------------------
 
 typedef struct {
@@ -89,6 +124,11 @@ typedef struct {
 
 	bool off;
 	char offMessage[160];
+
+	// Macapad 1.0's switches; hasSwitches is false for an older Mac
+	bool hasSwitches;
+	bool keepAwake, jiggler;
+	s64 keepAwakeUntil, jigglerUntil;  // ms since 1970 when it turns itself off; 0 = until turned off
 } Status;
 
 // Copies the latest status under the lock.
@@ -103,6 +143,12 @@ bool artwork_take(u8 **pixels, int *w, int *h);
 void press_key(const PadKey *key);
 // Steps for the physical buttons: a built-in action id like "play-pause".
 void press_action(const char *actionId);
+// Types text on the Mac, as if typed on its keyboard.
+void press_text(const char *text);
+// Presses one key combo, like "cmd+left".
+void press_combo(const char *keys);
+// Turns one of the Mac's switches on or off: "keepAwake" or "jiggler".
+void press_switch(const char *type, bool on);
 
 // The last press that went wrong (or the last notice); empty when there is none.
 // Each message stays for a few seconds.
@@ -114,6 +160,8 @@ void toast_set(const char *msg, bool isError);
 void macapad_init(void);   // once, before anything else
 void macapad_start(void);  // status + press threads; call once paired
 void macapad_stop(void);
+// A worker thread, on the system core when the app has a share of it.
+Thread macapad_spawn(ThreadFunc fn, void *arg);
 
 // ---- finding and pairing (each runs on its own thread) ----------------------
 

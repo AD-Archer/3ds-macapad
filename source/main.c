@@ -1,5 +1,6 @@
 // Macapad for 3DS: the top screen shows the time, what's playing and how the Mac is doing;
-// the bottom screen is a pad of keys that run things on the Mac.
+// the bottom screen is a pad of keys that run things on the Mac. It can also be a controller
+// (buttons, sticks and a trackpad, live) or a keyboard for the Mac.
 #include <3ds.h>
 #include <arpa/inet.h>
 #include <citro2d.h>
@@ -13,6 +14,7 @@
 
 #include "gfx.h"
 #include "http.h"
+#include "input.h"
 #include "macapad.h"
 #include "qrscan.h"
 
@@ -42,7 +44,7 @@
 #define FLICK_PX 22      // or a quick flick of at least this far
 #define FLICK_MS 260
 
-typedef enum { SCR_FIND, SCR_QR, SCR_PAIR, SCR_MAIN, SCR_LIST, SCR_KEYS } Screen;
+typedef enum { SCR_FIND, SCR_QR, SCR_PAIR, SCR_MAIN, SCR_LIST, SCR_KEYS, SCR_PAD, SCR_TYPE } Screen;
 
 // What the list on screen is for, so a pick knows where to go.
 typedef enum {
@@ -56,6 +58,10 @@ typedef enum {
 	LIST_LOOK,       // "How it looks": a key's name, icon and color, after picking what it does
 	LIST_GLYPH,      // the icon for it
 	LIST_COLOR,      // the color for it
+	LIST_PAD,        // "Use as a controller": start, the preset, changes
+	LIST_PADBUTTONS, // "Change a button": every button and stick
+	LIST_PADBIND,    // what one button does
+	LIST_PADSTICK,   // what one stick does
 } ListPurpose;
 
 typedef enum {
@@ -165,6 +171,8 @@ static u32 category_color(const char *cat) {
 	if (!strcmp(cat, "windows")) return C_YELLOW;
 	if (!strcmp(cat, "browser")) return C_BLUE;
 	if (!strcmp(cat, "editing")) return C_ORANGE;
+	if (!strcmp(cat, "accessibility")) return C_PINK;
+	if (!strcmp(cat, "mouse")) return C_GRAY;
 	return C_PURPLE;
 }
 
@@ -277,6 +285,20 @@ static const struct { const char *id; Glyph g; } s_actionGlyphs[] = {
 	{"address-bar", GLYPH_ADDRESS},
 	{"copy", GLYPH_COPY}, {"paste", GLYPH_PASTE}, {"cut", GLYPH_CUT}, {"undo", GLYPH_UNDO}, {"redo", GLYPH_REDO},
 	{"select-all", GLYPH_SELECT_ALL}, {"find", GLYPH_SEARCH}, {"save", GLYPH_SAVE},
+	{"window-left", GLYPH_HALF_LEFT}, {"window-right", GLYPH_HALF_RIGHT}, {"window-top", GLYPH_HALF_TOP},
+	{"window-bottom", GLYPH_HALF_BOTTOM}, {"window-top-left", GLYPH_QUARTER_TL}, {"window-top-right", GLYPH_QUARTER_TR},
+	{"window-bottom-left", GLYPH_QUARTER_BL}, {"window-bottom-right", GLYPH_QUARTER_BR},
+	{"window-maximize", GLYPH_FILL_SCREEN}, {"window-center", GLYPH_CENTER}, {"window-next-display", GLYPH_MONITOR},
+	{"window-restore", GLYPH_UNDO},
+	{"keep-awake", GLYPH_COFFEE}, {"jiggler", GLYPH_MOUSE}, {"siri", GLYPH_MIC},
+	{"brightness-up", GLYPH_SUN}, {"brightness-down", GLYPH_SUN_LOW}, {"dark-mode", GLYPH_MOON},
+	{"sleep-display", GLYPH_MONITOR}, {"sleep", GLYPH_MOON}, {"screen-saver", GLYPH_MONITOR},
+	{"show-desktop", GLYPH_MONITOR}, {"force-quit", GLYPH_CLOSE},
+	{"accessibility-shortcuts", GLYPH_PERSON}, {"voiceover", GLYPH_SPEAK}, {"zoom", GLYPH_ZOOM_IN},
+	{"zoom-in", GLYPH_ZOOM_IN}, {"zoom-out", GLYPH_ZOOM_OUT}, {"invert-colors", GLYPH_INVERT},
+	{"speak-selection", GLYPH_SPEAK}, {"left-click", GLYPH_CLICK_LEFT}, {"right-click", GLYPH_CLICK_RIGHT},
+	{"wifi", GLYPH_WIFI}, {"bluetooth", GLYPH_BLUETOOTH}, {"stage-manager", GLYPH_STAGE}, {"hidden-files", GLYPH_EYE},
+	{"empty-trash", GLYPH_TRASH}, {"eject-disks", GLYPH_EJECT}, {"restart", GLYPH_REFRESH}, {"shut-down", GLYPH_POWER},
 };
 
 // Material Symbols names the Mac suggests, for actions made there.
@@ -301,6 +323,20 @@ static const struct { const char *name; Glyph g; } s_iconGlyphs[] = {
 	{"keyboard", GLYPH_KEYS}, {"schedule", GLYPH_CLOCK}, {"laptop_mac", GLYPH_LAPTOP}, {"edit", GLYPH_PENCIL},
 	{"delete", GLYPH_TRASH}, {"add", GLYPH_PLUS}, {"check", GLYPH_CHECK}, {"bolt", GLYPH_BOLT}, {"flash_on", GLYPH_BOLT},
 	{"terminal", GLYPH_KEYS}, {"shortcut", GLYPH_SHORTCUT}, {"app", GLYPH_APP},
+	{"splitscreen_left", GLYPH_HALF_LEFT}, {"splitscreen_right", GLYPH_HALF_RIGHT},
+	{"splitscreen_top", GLYPH_HALF_TOP}, {"splitscreen_bottom", GLYPH_HALF_BOTTOM},
+	{"north_west", GLYPH_QUARTER_TL}, {"north_east", GLYPH_QUARTER_TR}, {"south_west", GLYPH_QUARTER_BL},
+	{"south_east", GLYPH_QUARTER_BR}, {"fit_screen", GLYPH_FILL_SCREEN}, {"filter_center_focus", GLYPH_CENTER},
+	{"restore", GLYPH_UNDO}, {"coffee", GLYPH_COFFEE}, {"mouse", GLYPH_MOUSE}, {"mic", GLYPH_MIC},
+	{"brightness_high", GLYPH_SUN}, {"brightness_low", GLYPH_SUN_LOW}, {"light_mode", GLYPH_SUN},
+	{"dark_mode", GLYPH_MOON}, {"bedtime", GLYPH_MOON}, {"desktop_access_disabled", GLYPH_MONITOR},
+	{"wallpaper", GLYPH_MONITOR}, {"desktop_windows", GLYPH_MONITOR},
+	{"accessibility_new", GLYPH_PERSON}, {"accessibility", GLYPH_PERSON}, {"record_voice_over", GLYPH_SPEAK},
+	{"text_to_speech", GLYPH_SPEAK}, {"zoom_in", GLYPH_ZOOM_IN}, {"zoom_out", GLYPH_ZOOM_OUT},
+	{"invert_colors", GLYPH_INVERT}, {"left_click", GLYPH_CLICK_LEFT}, {"right_click", GLYPH_CLICK_RIGHT},
+	{"sports_esports", GLYPH_GAMEPAD}, {"gamepad", GLYPH_GAMEPAD},
+	{"wifi", GLYPH_WIFI}, {"bluetooth", GLYPH_BLUETOOTH}, {"eject", GLYPH_EJECT}, {"visibility", GLYPH_EYE},
+	{"restart_alt", GLYPH_REFRESH}, {"view_sidebar", GLYPH_STAGE},
 };
 
 static Glyph glyph_for_icon(const char *name) {
@@ -329,11 +365,19 @@ static const GlyphChoice s_glyphChoices[] = {
 	{"crop", "Crop", GLYPH_CROP, 1}, {"monitor", "Screen", GLYPH_MONITOR, 1}, {"grid_view", "Grid", GLYPH_GRID, 1},
 	{"web_asset", "Windows", GLYPH_WINDOWS, 1}, {"lock", "Lock", GLYPH_LOCK, 1}, {"power", "Power", GLYPH_POWER, 1},
 	{"laptop_mac", "Laptop", GLYPH_LAPTOP, 1}, {"schedule", "Clock", GLYPH_CLOCK, 1}, {"keyboard", "Keyboard", GLYPH_KEYS, 1},
-	{"app", "App", GLYPH_APP, 1},
+	{"app", "App", GLYPH_APP, 1}, {"coffee", "Coffee", GLYPH_COFFEE, 1}, {"mic", "Microphone", GLYPH_MIC, 1},
+	{"brightness_high", "Brightness", GLYPH_SUN, 1}, {"dark_mode", "Moon", GLYPH_MOON, 1},
+	{"accessibility_new", "Accessibility", GLYPH_PERSON, 1}, {"record_voice_over", "Speech", GLYPH_SPEAK, 1},
+	{"zoom_in", "Zoom in", GLYPH_ZOOM_IN, 1}, {"zoom_out", "Zoom out", GLYPH_ZOOM_OUT, 1},
+	{"mouse", "Mouse", GLYPH_MOUSE, 1}, {"sports_esports", "Controller", GLYPH_GAMEPAD, 1},
+	{"wifi", "Wi-Fi", GLYPH_WIFI, 1}, {"bluetooth", "Bluetooth", GLYPH_BLUETOOTH, 1}, {"eject", "Eject", GLYPH_EJECT, 1},
+	{"visibility", "Eye", GLYPH_EYE, 1},
 	{"arrow_downward", "Minimize", GLYPH_MINIMIZE, 2}, {"fullscreen", "Expand", GLYPH_EXPAND, 2}, {"close", "Close", GLYPH_CLOSE, 2},
 	{"refresh", "Refresh", GLYPH_REFRESH, 2}, {"remove_circle", "Minus", GLYPH_MINUS_CIRCLE, 2}, {"tab", "Tab", GLYPH_TAB, 2},
 	{"arrow_back", "Arrow left", GLYPH_ARROW_LEFT, 2}, {"arrow_forward", "Arrow right", GLYPH_ARROW_RIGHT, 2},
 	{"link", "Address bar", GLYPH_ADDRESS, 2}, {"language", "Globe", GLYPH_GLOBE, 2},
+	{"splitscreen_left", "Left half", GLYPH_HALF_LEFT, 2}, {"splitscreen_right", "Right half", GLYPH_HALF_RIGHT, 2},
+	{"fit_screen", "Fill screen", GLYPH_FILL_SCREEN, 2},
 	{"content_copy", "Copy", GLYPH_COPY, 3}, {"content_paste", "Paste", GLYPH_PASTE, 3}, {"content_cut", "Cut", GLYPH_CUT, 3},
 	{"select_all", "Select all", GLYPH_SELECT_ALL, 3}, {"undo", "Undo", GLYPH_UNDO, 3}, {"redo", "Redo", GLYPH_REDO, 3},
 	{"save", "Save", GLYPH_SAVE, 3}, {"edit", "Pencil", GLYPH_PENCIL, 3}, {"delete", "Trash", GLYPH_TRASH, 3},
@@ -544,7 +588,7 @@ static void open_kind_menu(void) {
 	add_search_row("Search actions, apps, Shortcuts");
 	Item *it;
 	it = list_add(ROW_CHEVRON, "Mac action", "", KEY_ACTION);
-	copy(it->sub, sizeof it->sub, "Media, windows, browser, editing");
+	copy(it->sub, sizeof it->sub, "Media, windows, Siri and more");
 	it->icon = GLYPH_BOLT;
 	it->color = C_GREEN;
 	it = list_add(ROW_CHEVRON, "Open an app", "", KEY_APP);
@@ -747,12 +791,81 @@ static void open_menu(void) {
 	menu_build();
 }
 
+// ---- the Mac's switches: Keep Mac awake and Mouse jiggler ----------------------------------
+
+static const char *s_switchSteps[2] = {"keepAwake", "jiggler"};
+// One just flipped shows its new state until the Mac's status agrees, or a few seconds pass.
+static int s_switchWant[2] = {-1, -1};
+static u64 s_switchAt[2];
+
+static bool switch_on(int i) {
+	bool now = i == 0 ? s_st.keepAwake : s_st.jiggler;
+	if (s_switchWant[i] >= 0 && now != s_switchWant[i] && osGetTime() - s_switchAt[i] < 5000) return s_switchWant[i];
+	s_switchWant[i] = -1;
+	return now;
+}
+
+static void switch_flip(int i) {
+	if (s_st.live && !s_st.hasSwitches) {
+		toast_set("Update Macapad on your Mac to use this.", true);
+		return;
+	}
+	bool on = !switch_on(i);
+	press_switch(s_switchSteps[i], on);
+	s_switchWant[i] = on;
+	s_switchAt[i] = osGetTime();
+}
+
+// The line under a switch: what it does, or until when it's on.
+static void switch_sub(int i, char *out, size_t size) {
+	s64 until = i == 0 ? s_st.keepAwakeUntil : s_st.jigglerUntil;
+	if (s_st.live && !s_st.hasSwitches) {
+		copy(out, size, "Update Macapad on your Mac");
+	} else if (switch_on(i) && until && s_switchWant[i] < 0) {
+		// in the Mac's time, like the clock
+		time_t t = until / 1000 + s_st.utcOffset;
+		struct tm *tm = gmtime(&t);
+		int hour = tm->tm_hour;
+		if (g_config.clock24) snprintf(out, size, "On until %02d:%02d", hour, tm->tm_min);
+		else snprintf(out, size, "On until %d:%02d %s", hour % 12 ? hour % 12 : 12, tm->tm_min, hour < 12 ? "AM" : "PM");
+	} else {
+		copy(out, size, i == 0 ? "Stops the screen from sleeping" : "So you never show as away");
+	}
+}
+
+// Keeps the menu's switches current while it's open.
+static void switches_update(void) {
+	for (int n = 0; n < s_list.count; n++) {
+		Item *it = &s_list.items[n];
+		int i = !strcmp(it->value, "awake") ? 0 : !strcmp(it->value, "jiggler") ? 1 : -1;
+		if (i < 0) continue;
+		it->on = switch_on(i);
+		switch_sub(i, it->sub, sizeof it->sub);
+	}
+}
+
 // The START menu. Built again in place when something in it changes, so the scroll stays put.
 static void menu_build(void) {
 	free(s_list.items);
 	s_list.items = NULL;
 	s_list.count = 0;
 	Item *it;
+
+	list_header("Control your Mac");
+	it = list_add(ROW_CHEVRON, "Use as a controller", "controller", 0);
+	copy(it->detail, sizeof it->detail, preset_name(g_controller.preset));
+	it->icon = GLYPH_GAMEPAD;
+	it->color = C_GREEN;
+	it = list_add(ROW_CHEVRON, "Type on your Mac", "type", 0);
+	it->icon = GLYPH_KEYS;
+	it->color = C_ORANGE;
+	it = list_add(ROW_TOGGLE, "Keep Mac awake", "awake", 0);
+	it->icon = GLYPH_COFFEE;
+	it->color = C_TEAL;
+	it = list_add(ROW_TOGGLE, "Mouse jiggler", "jiggler", 0);
+	it->icon = GLYPH_MOUSE;
+	it->color = C_TEAL;
+	switches_update();
 
 	list_header("Pages");
 	for (int i = 0; i < g_pads.count; i++) {
@@ -824,7 +937,10 @@ static const char *s_keyNames[][2] = {
 	{".", "."}, {"/", "/"}, {"`", "`"},
 };
 
-static void open_keyname_list(void) {
+static bool s_keyListForPad;  // picking a key for a controller button itself (not for the shortcut builder)
+
+static void open_keyname_list(bool forPad) {
+	s_keyListForPad = forPad;
 	list_open(LIST_KEYNAME, "Which key?");
 	char v[4], l[4];
 	list_header("Letters");
@@ -840,6 +956,12 @@ static void open_keyname_list(void) {
 	}
 	list_header("Other keys");
 	for (size_t i = 0; i < sizeof s_keyNames / sizeof *s_keyNames; i++) list_add(ROW_PLAIN, s_keyNames[i][1], s_keyNames[i][0], 0);
+	if (forPad) {
+		// held on their own, like Shift for SELECT in a game
+		list_header("Shift and the like");
+		static const char *mods[][2] = {{"shift", "Shift"}, {"rshift", "Right Shift"}, {"cmd", "Command"}, {"opt", "Option"}, {"ctrl", "Control"}, {"fn", "fn"}};
+		for (size_t i = 0; i < sizeof mods / sizeof *mods; i++) list_add(ROW_PLAIN, mods[i][1], mods[i][0], 0);
+	}
 	list_header("Function keys");
 	for (int f = 1; f <= 12; f++) {
 		char fv[8], fl[8];
@@ -849,6 +971,206 @@ static void open_keyname_list(void) {
 	}
 	list_layout();
 }
+
+// ---- the controller's settings -----------------------------------------------------------
+
+static bool s_isNew3ds;      // has ZL, ZR and the C-Stick
+static Control s_ctl;        // the button or stick being changed
+static bool s_keysForPad;    // the shortcut builder is picking for s_ctl
+
+static const char *s_controlNames[CTL_COUNT] = {
+	"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Up", "Down", "Left", "Right", "START", "SELECT", "Circle Pad", "C-Stick",
+};
+
+static bool control_exists(Control c) { return s_isNew3ds || (c != CTL_ZL && c != CTL_ZR && c != CTL_CSTICK); }
+static bool control_is_stick(Control c) { return c == CTL_CIRCLE || c == CTL_CSTICK; }
+static bool control_changed(Control c) { return g_controller.changes[g_controller.preset][c][0] != 0; }
+
+// One key as it's written on it: "x" -> "X", "return" -> "Return", "cmd" -> "Cmd".
+static void key_label(const char *name, char *out, size_t size) {
+	static const char *more[][2] = {
+		{"cmd", "Cmd"}, {"shift", "Shift"}, {"opt", "Opt"}, {"ctrl", "Ctrl"}, {"fn", "fn"}, {"rshift", "Right Shift"}, {"esc", "Esc"}, {"escape", "Esc"},
+		{"left", "Left"}, {"right", "Right"}, {"up", "Up"}, {"down", "Down"},
+	};
+	for (size_t i = 0; i < sizeof more / sizeof *more; i++)
+		if (!strcmp(name, more[i][0])) { copy(out, size, more[i][1]); return; }
+	for (size_t i = 0; i < sizeof s_keyNames / sizeof *s_keyNames; i++)
+		if (!strcmp(name, s_keyNames[i][0])) { copy(out, size, s_keyNames[i][1]); return; }
+	copy(out, size, name);
+	if (out[0]) out[0] = (char)toupper((unsigned char)out[0]);  // "x" -> "X", "f5" -> "F5"
+}
+
+// What a binding does, in words: "Left click", "Cmd + Tab", "Move the pointer".
+static void binding_label(const char *b, char *out, size_t size) {
+	static const char *named[][2] = {
+		{"none", "Nothing"}, {"click:left", "Left click"}, {"click:right", "Right click"}, {"click:middle", "Middle click"},
+		{"pointer", "Move the pointer"}, {"scroll", "Scroll"}, {"arrows", "Arrow keys"}, {"wasd", "W A S D keys"},
+	};
+	for (size_t i = 0; i < sizeof named / sizeof *named; i++)
+		if (!strcmp(b, named[i][0])) { copy(out, size, named[i][1]); return; }
+	char buf[64], *save = NULL, label[24];
+	copy(buf, sizeof buf, b);
+	out[0] = 0;
+	for (char *k = strtok_r(buf, "+", &save); k; k = strtok_r(NULL, "+", &save)) {
+		key_label(k, label, sizeof label);
+		snprintf(out + strlen(out), size - strlen(out), "%s%s", out[0] ? " + " : "", label);
+	}
+}
+
+// The tile at the left of a control's row: its letters, or an arrow for the +Control Pad.
+static void control_tile(Item *it, Control c) {
+	switch (c) {
+	case CTL_UP: it->icon = GLYPH_ARROW_UP; break;
+	case CTL_DOWN: it->icon = GLYPH_ARROW_DOWN; break;
+	case CTL_LEFT: it->icon = GLYPH_ARROW_LEFT; break;
+	case CTL_RIGHT: it->icon = GLYPH_ARROW_RIGHT; break;
+	case CTL_CIRCLE: case CTL_CSTICK: it->icon = GLYPH_GAMEPAD; break;
+	case CTL_START: copy(it->tag, sizeof it->tag, "ST"); break;
+	case CTL_SELECT: copy(it->tag, sizeof it->tag, "SE"); break;
+	default: copy(it->tag, sizeof it->tag, s_controlNames[c]); break;
+	}
+	// the New 3DS's colors
+	it->color = c == CTL_A ? C_RED : c == CTL_B ? C_YELLOW : c == CTL_X ? C_BLUE : c == CTL_Y ? C_GREEN : C_GRAY;
+}
+
+// "Use as a controller": start, which preset, and changes to it. Built again in place.
+static void pad_setup_build(void) {
+	free(s_list.items);
+	s_list.items = NULL;
+	s_list.count = 0;
+	Item *it = list_add(ROW_PLAIN, "Start", "start", 0);
+	copy(it->sub, sizeof it->sub, "To stop, press START and SELECT together");
+	it->icon = GLYPH_PLAY;
+	it->color = C_GREEN;
+
+	list_header("Preset");
+	static const Glyph glyphs[PRESETS] = {GLYPH_MOUSE, GLYPH_GAMEPAD, GLYPH_KEYS};
+	u32 colors[PRESETS] = {C_BLUE, C_PURPLE, C_ORANGE};
+	for (int p = 0; p < PRESETS; p++) {
+		it = list_add(ROW_CHECK, preset_name(p), "preset", p);
+		copy(it->sub, sizeof it->sub, preset_about(p));
+		it->icon = glyphs[p];
+		it->color = colors[p];
+		it->on = p == g_controller.preset;
+	}
+
+	list_header(preset_name(g_controller.preset));
+	int n = preset_changes(g_controller.preset);
+	it = list_add(ROW_CHEVRON, "Change a button", "buttons", 0);
+	if (n) snprintf(it->detail, sizeof it->detail, n == 1 ? "1 change" : "%d changes", n);
+	it->icon = GLYPH_PENCIL;
+	it->color = C_ORANGE;
+	if (n) {
+		it = list_add(ROW_PLAIN, "Back to preset", "reset", 0);
+		copy(it->sub, sizeof it->sub, n == 1 ? "Undo your change" : "Undo your changes");
+		it->icon = GLYPH_UNDO;
+		it->color = C_GRAY;
+	}
+	list_layout();
+}
+
+static void open_pad_setup(void) {
+	list_open(LIST_PAD, "Use as a controller");
+	pad_setup_build();
+}
+
+// Every button and stick, with what it does. Starts on the one changed last.
+static void open_pad_buttons(void) {
+	static const struct { const char *title; Control from, to; } groups[] = {
+		{"Buttons", CTL_A, CTL_Y}, {"Shoulder buttons", CTL_L, CTL_ZR}, {"+Control Pad", CTL_UP, CTL_RIGHT},
+		{"Sticks", CTL_CIRCLE, CTL_CSTICK}, {"START and SELECT", CTL_START, CTL_SELECT},
+	};
+	list_open(LIST_PADBUTTONS, "Change a button");
+	int sel = -1;
+	for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {
+		list_header(groups[g].title);
+		for (Control c = groups[g].from; c <= groups[g].to; c++) {
+			if (!control_exists(c)) continue;
+			Item *it = list_add(ROW_CHEVRON, s_controlNames[c], "", c);
+			binding_label(control_binding(c), it->detail, sizeof it->detail);
+			if (control_changed(c)) {
+				char was[32];
+				binding_label(preset_binding(g_controller.preset, c), was, sizeof was);
+				snprintf(it->sub, sizeof it->sub, "Changed from %s", was);
+			} else {
+				copy(it->sub, sizeof it->sub, preset_note(g_controller.preset, c));
+			}
+			control_tile(it, c);
+			if (c == s_ctl) sel = s_list.count - 1;
+		}
+	}
+	list_layout();
+	if (sel >= 0) {
+		s_list.sel = sel;
+		list_show_sel();
+	}
+}
+
+// What one button (or stick) should do.
+static void open_pad_bind(void) {
+	Control c = s_ctl;
+	const char *b = control_binding(c);
+	char question[64];
+	snprintf(question, sizeof question, control_is_stick(c) ? "What should the %s do?" : "What should %s do?", s_controlNames[c]);
+	list_open(control_is_stick(c) ? LIST_PADSTICK : LIST_PADBIND, "Change a button");
+	list_header(question);
+	Item *it;
+	if (control_is_stick(c)) {
+		static const char *jobs[][2] = {
+			{"pointer", "Move the pointer"}, {"scroll", "Scroll"}, {"arrows", "Arrow keys"}, {"wasd", "W A S D keys"},
+		};
+		static const Glyph glyphs[] = {GLYPH_MOUSE, GLYPH_ARROW_DOWN, GLYPH_ARROW_RIGHT, GLYPH_KEYS};
+		for (size_t i = 0; i < sizeof jobs / sizeof *jobs; i++) {
+			it = list_add(ROW_CHECK, jobs[i][1], jobs[i][0], 0);
+			it->icon = glyphs[i];
+			it->color = i < 2 ? C_BLUE : C_ORANGE;
+			it->on = !strcmp(b, jobs[i][0]);
+		}
+	} else {
+		static const char *clicks[][2] = {{"click:left", "Left click"}, {"click:right", "Right click"}, {"click:middle", "Middle click"}};
+		static const Glyph glyphs[] = {GLYPH_CLICK_LEFT, GLYPH_CLICK_RIGHT, GLYPH_MOUSE};
+		for (int i = 0; i < 3; i++) {
+			it = list_add(ROW_CHECK, clicks[i][1], clicks[i][0], 0);
+			it->icon = glyphs[i];
+			it->color = C_BLUE;
+			it->on = !strcmp(b, clicks[i][0]);
+		}
+		list_header("");
+		bool key = strncmp(b, "click:", 6) && strcmp(b, "none"), combo = key && strchr(b, '+');
+		it = list_add(ROW_CHEVRON, "A key", "key", 0);
+		if (key && !combo) binding_label(b, it->detail, sizeof it->detail);
+		it->icon = GLYPH_KEYS;
+		it->color = C_ORANGE;
+		it = list_add(ROW_CHEVRON, "Keys together", "combo", 0);
+		copy(it->sub, sizeof it->sub, "Like Cmd + Tab");
+		if (combo) binding_label(b, it->detail, sizeof it->detail);
+		it->icon = GLYPH_KEYS;
+		it->color = C_PURPLE;
+	}
+	list_header("");
+	it = list_add(ROW_CHECK, "Nothing", "none", 0);
+	it->icon = GLYPH_MINUS_CIRCLE;
+	it->color = C_GRAY;
+	it->on = !strcmp(b, "none");
+	if (control_changed(c)) {
+		list_header("");
+		it = list_add(ROW_PLAIN, "Back to preset", "reset", 0);
+		binding_label(preset_binding(g_controller.preset, c), it->detail, sizeof it->detail);
+		it->icon = GLYPH_UNDO;
+		it->color = C_GRAY;
+	}
+	list_layout();
+	list_select_checked();
+}
+
+static void pad_bind(const char *binding) {
+	control_set(s_ctl, binding);
+	controller_save();
+	open_pad_buttons();
+}
+
+static void start_pad(void);
+static void start_type(void);
 
 static void set_key(KeyKind kind, const char *label, const char *ref, const char *category, const char *icon) {
 	PadKey *k = edit_key();
@@ -920,6 +1242,7 @@ static void list_picked(int i) {
 		case KEY_KEYS:
 			memset(s_mods, 0, sizeof s_mods);
 			s_keyName[0] = s_keyLabel[0] = 0;
+			s_keysForPad = false;
 			s_screen = SCR_KEYS;
 			break;
 		case 100:
@@ -970,6 +1293,10 @@ static void list_picked(int i) {
 		open_look();
 		break;
 	case LIST_KEYNAME:
+		if (s_keyListForPad) {
+			pad_bind(it->value);
+			break;
+		}
 		copy(s_keyName, sizeof s_keyName, it->value);
 		copy(s_keyLabel, sizeof s_keyLabel, it->label);
 		s_screen = SCR_KEYS;
@@ -1003,6 +1330,14 @@ static void list_picked(int i) {
 			if (s_page >= g_pads.count) s_page = g_pads.count - 1;
 			pads_save();
 			menu_build();
+		} else if (!strcmp(id, "controller")) {
+			open_pad_setup();
+		} else if (!strcmp(id, "type")) {
+			start_type();
+		} else if (!strcmp(id, "awake")) {
+			switch_flip(0);
+		} else if (!strcmp(id, "jiggler")) {
+			switch_flip(1);
 		} else if (!strcmp(id, "clock")) {
 			g_config.clock24 = !g_config.clock24;
 			config_save();
@@ -1018,12 +1353,52 @@ static void list_picked(int i) {
 		}
 		break;
 	}
+	case LIST_PAD:
+		if (!strcmp(it->value, "start")) {
+			start_pad();
+		} else if (!strcmp(it->value, "preset")) {
+			g_controller.preset = it->id;
+			controller_save();
+			pad_setup_build();
+		} else if (!strcmp(it->value, "buttons")) {
+			open_pad_buttons();
+		} else if (!strcmp(it->value, "reset")) {
+			memset(g_controller.changes[g_controller.preset], 0, sizeof g_controller.changes[0]);
+			controller_save();
+			pad_setup_build();
+		}
+		break;
+	case LIST_PADBUTTONS:
+		s_ctl = it->id;
+		open_pad_bind();
+		break;
+	case LIST_PADBIND: case LIST_PADSTICK:
+		if (!strcmp(it->value, "key")) {
+			open_keyname_list(true);
+		} else if (!strcmp(it->value, "combo")) {
+			memset(s_mods, 0, sizeof s_mods);
+			s_keyName[0] = s_keyLabel[0] = 0;
+			s_keysForPad = true;
+			s_screen = SCR_KEYS;
+		} else {
+			char binding[24];
+			copy(binding, sizeof binding, !strcmp(it->value, "reset") ? "" : it->value);  // (the rows go away)
+			pad_bind(binding);
+		}
+		break;
 	}
 }
 
 static void list_back(void) {
 	if (s_list.purpose == LIST_KEYNAME) {
-		s_screen = SCR_KEYS;
+		if (s_keyListForPad) open_pad_bind();
+		else s_screen = SCR_KEYS;
+	} else if (s_list.purpose == LIST_PAD) {
+		open_menu();
+	} else if (s_list.purpose == LIST_PADBUTTONS) {
+		open_pad_setup();
+	} else if (s_list.purpose == LIST_PADBIND || s_list.purpose == LIST_PADSTICK) {
+		open_pad_buttons();
 	} else if (s_list.purpose == LIST_GLYPH || s_list.purpose == LIST_COLOR) {
 		open_look();
 	} else if (is_catalog() || s_list.purpose == LIST_SEARCH) {
@@ -1163,6 +1538,7 @@ static void list_update(u32 down, u32 held, touchPosition touch) {
 		}
 	}
 	refresh_row_update();
+	if (s_list.purpose == LIST_MENU) switches_update();
 
 	if (down & KEY_B) { list_back(); return; }
 	if ((down & KEY_Y) && searchable()) { list_search(); return; }
@@ -1329,20 +1705,27 @@ static void keys_combo(char *keys, size_t ksize, char *label, size_t lsize) {
 #define MOD_Y 70
 #define MOD_W 72
 
+// Back from the shortcut builder: to the key editor, or to what a controller button does.
+static void keys_back(void) {
+	if (s_keysForPad) open_pad_bind();
+	else open_kind_menu();
+}
+
 static void keys_tap(touchPosition t) {
 	for (int i = 0; i < 4; i++)
 		if (in(t, 8 + i * (MOD_W + 4), MOD_Y, MOD_W, 44)) s_mods[i] = !s_mods[i];
-	if (in(t, 8, 124, 304, 44)) open_keyname_list();
-	if (in(t, 0, 0, 90, 32)) open_kind_menu();
+	if (in(t, 8, 124, 304, 44)) open_keyname_list(false);
+	if (in(t, 0, 0, 90, 32)) keys_back();
 	if (s_keyName[0] && in(t, 8, 184, 304, 44)) {
 		char keys[64], label[48];
 		keys_combo(keys, sizeof keys, label, sizeof label);
-		set_key(KEY_KEYS, label, keys, "", "");
+		if (s_keysForPad) pad_bind(keys);
+		else set_key(KEY_KEYS, label, keys, "", "");
 	}
 }
 
 static void keys_draw(void) {
-	header("Keyboard shortcut", "\xE2\x80\xB9 Back", false);
+	header(s_keysForPad ? "Keys together" : "Keyboard shortcut", "\xE2\x80\xB9 Back", false);
 	text(BOTTOM_W / 2, 40, 0.45f, C_TEXT2, C2D_AlignCenter, "Hold down\xE2\x80\xA6");
 	for (int i = 0; i < 4; i++) {
 		float x = 8 + i * (MOD_W + 4);
@@ -1461,6 +1844,9 @@ static void key_draw(int page, int slot, float dx, bool pressed) {
 	key_tile(k, x, y, flash);
 	if (k->kind == KEY_NONE) return;
 	if (s_editing) disc(x + KEY_W - 9, y + 9, 4, C_ORANGE);
+	// Keep Mac awake and Mouse jiggler show when they're on
+	if (k->kind == KEY_ACTION && ((!strcmp(k->ref, "keep-awake") && switch_on(0)) || (!strcmp(k->ref, "jiggler") && switch_on(1))))
+		disc(x + 9, y + 9, 3.5f, C_GREEN);
 	if (s_st.off) rrect(x, y, KEY_W, KEY_H, 12, C2D_Color32(0, 0, 0, 0x90));
 }
 
@@ -1533,6 +1919,442 @@ static void swipe_update(bool released) {
 	if (!s_swiping && s_slide != 0) {
 		s_slide *= 0.68f;
 		if (fabsf(s_slide) < 0.5f) s_slide = 0;
+	}
+}
+
+// ---- the 3DS as a controller ---------------------------------------------------------------
+
+// The bottom screen: a trackpad, a scroll strip at its right, and two click buttons under them.
+#define PAD_TOP 38
+#define PAD_BOTTOM 192
+#define STRIP_W 48
+#define STRIP_X (BOTTOM_W - 8 - STRIP_W)
+#define CLICK_Y 198
+#define CLICK_H 36
+#define TAP_MS 250       // a touch this short that didn't move is a click
+#define CLICK_MS 70      // how long that click holds the button down
+#define LATE_MS 80       // START and SELECT count only once held this long, so pressing both to stop presses neither
+
+typedef enum { ZONE_NONE, ZONE_DONE, ZONE_TRACKPAD, ZONE_SCROLL, ZONE_LEFT, ZONE_RIGHT } Zone;
+
+static const u32 s_controlKeys[CTL_COUNT] = {
+	KEY_A, KEY_B, KEY_X, KEY_Y, KEY_L, KEY_R, KEY_ZL, KEY_ZR, KEY_DUP, KEY_DDOWN, KEY_DLEFT, KEY_DRIGHT, KEY_START, KEY_SELECT,
+};
+
+static u32 s_padIgnore;     // buttons already down when the screen opened: they count once let go
+static u32 s_padHeld;       // the buttons that counted this frame, lit on the top screen
+static bool s_stickLit[2];  // the Circle Pad and C-Stick are pushed
+static u64 s_lateSince[2];  // START, SELECT: when they went down (0 = up)
+static u64 s_lateUntil[2];  // a quick tap of one, held down this long after the fact
+static Zone s_zone;         // where this touch started
+static float s_fingerX, s_fingerY;  // where the finger is, smoothed (the touch screen wobbles a little)
+static int s_touchFrames;
+static u64 s_clickUntil;    // a tap on the trackpad: the left button is down until then
+static u64 s_padOpenedAt;
+
+static Zone zone_at(touchPosition t) {
+	if (in(t, 0, 0, 90, 32)) return ZONE_DONE;
+	if (in(t, 8, CLICK_Y, BOTTOM_W / 2 - 10, CLICK_H)) return ZONE_LEFT;
+	if (in(t, BOTTOM_W / 2 + 2, CLICK_Y, BOTTOM_W / 2 - 10, CLICK_H)) return ZONE_RIGHT;
+	if (in(t, STRIP_X, PAD_TOP, STRIP_W, PAD_BOTTOM - PAD_TOP)) return ZONE_SCROLL;
+	if (in(t, 8, PAD_TOP, STRIP_X - 16, PAD_BOTTOM - PAD_TOP)) return ZONE_TRACKPAD;
+	return ZONE_NONE;
+}
+
+static void start_pad(void) {
+	s_padIgnore = hidKeysHeld();
+	s_padHeld = 0;
+	memset(s_lateSince, 0, sizeof s_lateSince);
+	memset(s_lateUntil, 0, sizeof s_lateUntil);
+	s_zone = ZONE_NONE;
+	s_clickUntil = 0;
+	s_padOpenedAt = osGetTime();
+	input_start();
+	s_screen = SCR_PAD;
+}
+
+// Lets go of everything on the Mac and goes back to the settings.
+static void stop_pad(void) {
+	input_stop();
+	open_pad_setup();
+}
+
+// -1..1 past a small dead zone.
+static float stick_axis(int v) {
+	float f = v / 150.0f, dz = 0.12f;
+	if (f > 1) f = 1;
+	if (f < -1) f = -1;
+	if (fabsf(f) < dz) return 0;
+	return (f > 0 ? f - dz : f + dz) / (1 - dz);
+}
+
+// A stick's share of this frame: pointer or scroll movement, or keys held.
+static bool stick_apply(const char *job, circlePosition p, InputHeld *h, float *mx, float *my, float *sx, float *sy) {
+	float x = stick_axis(p.dx), y = -stick_axis(p.dy);  // down is positive, as on the screen
+	if (!strcmp(job, "pointer")) {
+		// slow near the middle for aiming, quick at the edge
+		*mx += x * (fabsf(x) * 16 + 2);
+		*my += y * (fabsf(y) * 16 + 2);
+	} else if (!strcmp(job, "scroll")) {
+		*sx += x * fabsf(x) * 20;
+		*sy += y * fabsf(y) * 20;  // pushed down shows what's further down
+	} else if (!strcmp(job, "arrows") || !strcmp(job, "wasd")) {
+		bool wasd = job[0] == 'w';
+		if (x < -0.4f) held_add(h, wasd ? "a" : "left");
+		if (x > 0.4f) held_add(h, wasd ? "d" : "right");
+		if (y < -0.4f) held_add(h, wasd ? "w" : "up");
+		if (y > 0.4f) held_add(h, wasd ? "s" : "down");
+	}
+	return x || y;
+}
+
+static void binding_apply(const char *b, InputHeld *h) {
+	if (!strcmp(b, "none")) return;
+	if (!strcmp(b, "click:left")) h->buttons |= MOUSE_LEFT;
+	else if (!strcmp(b, "click:right")) h->buttons |= MOUSE_RIGHT;
+	else if (!strcmp(b, "click:middle")) h->buttons |= MOUSE_MIDDLE;
+	else held_add_combo(h, b);
+}
+
+// Every frame: what's held and moved, all of it, to the Mac.
+static void pad_update(u32 down, u32 held, touchPosition touch, bool released) {
+	if ((held & KEY_START) && (held & KEY_SELECT)) {
+		stop_pad();
+		return;
+	}
+	u64 now = osGetTime();
+	s_padIgnore &= held;
+	held &= ~s_padIgnore;
+	down &= ~s_padIgnore;
+
+	InputHeld h = {0};
+	float mx = 0, my = 0, sx = 0, sy = 0;
+	s_padHeld = 0;
+	for (int c = 0; c < CTL_COUNT; c++) {
+		u32 bit = s_controlKeys[c];
+		if (!bit || !control_exists(c)) continue;
+		bool on = held & bit;
+		if (c == CTL_START || c == CTL_SELECT) {
+			int i = c == CTL_SELECT;
+			if (down & bit) s_lateSince[i] = now;
+			if (!on && s_lateSince[i]) {
+				if (now - s_lateSince[i] < LATE_MS) s_lateUntil[i] = now + LATE_MS;  // a quick tap still counts
+				s_lateSince[i] = 0;
+			}
+			on = (on && s_lateSince[i] && now - s_lateSince[i] >= LATE_MS) || now < s_lateUntil[i];
+		}
+		if (!on) continue;
+		s_padHeld |= bit;
+		binding_apply(control_binding(c), &h);
+	}
+
+	circlePosition cp;
+	hidCircleRead(&cp);
+	s_stickLit[0] = stick_apply(control_binding(CTL_CIRCLE), cp, &h, &mx, &my, &sx, &sy);
+	s_stickLit[1] = false;
+	if (s_isNew3ds) {
+		hidCstickRead(&cp);
+		s_stickLit[1] = stick_apply(control_binding(CTL_CSTICK), cp, &h, &mx, &my, &sx, &sy);
+	}
+
+	// the touch screen
+	if (down & KEY_TOUCH) {
+		s_zone = zone_at(touch);
+		s_fingerX = touch.px;
+		s_fingerY = touch.py;
+		s_touchFrames = 0;
+	}
+	if (held & KEY_TOUCH) {
+		float fx = s_fingerX + (touch.px - s_fingerX) * 0.6f, fy = s_fingerY + (touch.py - s_fingerY) * 0.6f;
+		float dx = fx - s_fingerX, dy = fy - s_fingerY;
+		s_fingerX = fx;
+		s_fingerY = fy;
+		if (++s_touchFrames > 2) {  // (the first readings of a touch jump about)
+			if (s_zone == ZONE_TRACKPAD) {
+				// faster swipes go further, slow ones stay precise
+				float speed = sqrtf(dx * dx + dy * dy), gain = 1.3f + (speed > 10 ? 10 : speed) * 0.27f;
+				mx += dx * gain;
+				my += dy * gain;
+			} else if (s_zone == ZONE_SCROLL) {
+				sy -= dy * 4;  // the page follows the finger, like a phone
+			}
+		}
+		if (s_zone == ZONE_LEFT) h.buttons |= MOUSE_LEFT;
+		if (s_zone == ZONE_RIGHT) h.buttons |= MOUSE_RIGHT;
+	}
+	if (released && s_zone == ZONE_TRACKPAD && !s_dragging && now - s_touchAt < TAP_MS) s_clickUntil = now + CLICK_MS;
+	if (released && s_zone == ZONE_DONE && !s_dragging) {
+		stop_pad();
+		return;
+	}
+	if (released) s_zone = ZONE_NONE;
+	if (now < s_clickUntil) h.buttons |= MOUSE_LEFT;
+
+	input_hold(&h);
+	input_move(mx, my, sx, sy);
+}
+
+// One row on the top screen: the button, lit while it's held, and what it does.
+static void control_row(Control c, float x, float y, bool lit) {
+	float bw = 46, bh = 16;
+	u32 bg = lit ? C_BLUE : C_CARD_HI;
+	rrect(x, y, bw, bh, 5, bg);
+	switch (c) {
+	case CTL_UP: glyph(GLYPH_ARROW_UP, x + bw / 2, y + bh / 2, 10, C_TEXT, bg); break;
+	case CTL_DOWN: glyph(GLYPH_ARROW_DOWN, x + bw / 2, y + bh / 2, 10, C_TEXT, bg); break;
+	case CTL_LEFT: glyph(GLYPH_ARROW_LEFT, x + bw / 2, y + bh / 2, 10, C_TEXT, bg); break;
+	case CTL_RIGHT: glyph(GLYPH_ARROW_RIGHT, x + bw / 2, y + bh / 2, 10, C_TEXT, bg); break;
+	default:
+		text_fit(x + bw / 2, y + 2, 0.36f, C_TEXT, C2D_AlignCenter, bw - 4, c == CTL_CIRCLE ? "Circle" : s_controlNames[c]);
+		break;
+	}
+	const char *b = control_binding(c), *note = control_changed(c) ? "" : preset_note(g_controller.preset, c);
+	char job[48];
+	binding_label(b, job, sizeof job);
+	float tx = x + bw + 8, maxw = 184 - bw - 8;
+	if (note[0]) {
+		// what it's for, then the keys
+		text_fit(tx, y, 0.45f, C_TEXT, 0, maxw, note);
+		float nw = text_width(note, 0.45f) + 6;
+		if (nw < maxw - 20) text_fit(tx + nw, y + 1.5f, 0.38f, C_TEXT3, 0, maxw - nw, job);
+	} else {
+		text_fit(tx, y, 0.45f, strcmp(b, "none") ? C_TEXT : C_TEXT3, 0, maxw, job);
+	}
+}
+
+static void pad_draw_top(void) {
+	InputInfo info;
+	input_info(&info);
+	text(14, 10, 0.7f, C_TEXT, 0, "Controller");
+
+	// whether it's getting through, at the right
+	const char *msg = "Connecting\xE2\x80\xA6";
+	u32 dot = C_TEXT3;
+	switch (info.state) {
+	case INPUT_CONNECTING: break;
+	case INPUT_LIVE:
+		if (info.through) {
+			msg = "Working";
+			dot = C_GREEN;
+		} else if (osGetTime() - s_padOpenedAt > 5000) {
+			msg = "Your Mac isn't answering";
+			dot = C_ORANGE;
+		}
+		break;
+	case INPUT_OFF: msg = "Paused on your Mac"; dot = C_ORANGE; break;
+	case INPUT_OUTDATED: msg = "Update Macapad on your Mac"; dot = C_ORANGE; break;
+	case INPUT_FORGOTTEN: msg = "Your Mac forgot this 3DS"; dot = C_RED; break;
+	case INPUT_AWAY: msg = "Can't reach your Mac"; dot = C_RED; break;
+	}
+	float w = text_width(msg, 0.45f);
+	text(TOP_W - 14, 15, 0.45f, dot == C_GREEN || dot == C_TEXT3 ? C_TEXT2 : dot, C2D_AlignRight, msg);
+	disc(TOP_W - 14 - w - 8, 23, 3.5f, dot);
+
+	// under the title: the preset, or the Mac's reason for being off
+	if (info.state == INPUT_OFF && info.message[0]) {
+		text_fit(15, 36, 0.45f, C_ORANGE, 0, 370, info.message);
+	} else if (info.state == INPUT_OUTDATED) {
+		text_fit(15, 36, 0.45f, C_TEXT2, 0, 370, "It needs Macapad 1.0 or later to be a controller.");
+	} else {
+		char line[96];
+		int n = preset_changes(g_controller.preset);
+		snprintf(line, sizeof line, "%s%s", preset_name(g_controller.preset), n ? " \xC2\xB7 with your changes" : "");
+		text_fit(15, 36, 0.45f, C_TEXT2, 0, 370, line);
+	}
+
+	// what each button does, as they sit on the 3DS: left side, right side
+	static const Control left[] = {CTL_L, CTL_ZL, CTL_UP, CTL_DOWN, CTL_LEFT, CTL_RIGHT, CTL_CIRCLE, CTL_SELECT};
+	static const Control right[] = {CTL_R, CTL_ZR, CTL_A, CTL_B, CTL_X, CTL_Y, CTL_CSTICK, CTL_START};
+	for (int side = 0; side < 2; side++) {
+		const Control *list = side ? right : left;
+		float x = side ? 206 : 14, y = 60;
+		for (int i = 0; i < 8; i++) {
+			Control c = list[i];
+			if (!control_exists(c)) continue;
+			bool lit = control_is_stick(c) ? s_stickLit[c == CTL_CSTICK] : (s_padHeld & s_controlKeys[c]) != 0;
+			control_row(c, x, y, lit);
+			y += 19;
+		}
+	}
+	text(TOP_W / 2, 218, 0.42f, C_TEXT3, C2D_AlignCenter, "To stop, press START and SELECT together.");
+}
+
+static void pad_draw_bottom(void) {
+	header("Controller", "\xE2\x80\xB9 Done", false);
+	bool touching = s_touching && s_zone != ZONE_NONE;
+
+	// the trackpad
+	float tw = STRIP_X - 16, th = PAD_BOTTOM - PAD_TOP;
+	rrect(8, PAD_TOP, tw, th, 12, C_CARD);
+	if (touching && s_zone == ZONE_TRACKPAD) {
+		disc(s_fingerX, s_fingerY, 16, C_CARD_HI);
+	} else {
+		text(8 + tw / 2, PAD_TOP + th / 2 - 18, 0.46f, C_TEXT3, C2D_AlignCenter, "Drag to move the pointer");
+		text(8 + tw / 2, PAD_TOP + th / 2 + 2, 0.46f, C_TEXT3, C2D_AlignCenter, "Tap to click");
+	}
+
+	// the scroll strip
+	u32 bg = touching && s_zone == ZONE_SCROLL ? C_CARD_HI : C_CARD;
+	rrect(STRIP_X, PAD_TOP, STRIP_W, th, 12, bg);
+	glyph(GLYPH_ARROW_UP, STRIP_X + STRIP_W / 2, PAD_TOP + 20, 12, C_TEXT3, bg);
+	text(STRIP_X + STRIP_W / 2, PAD_TOP + th / 2 - 7, 0.38f, C_TEXT3, C2D_AlignCenter, "Scroll");
+	glyph(GLYPH_ARROW_DOWN, STRIP_X + STRIP_W / 2, PAD_BOTTOM - 20, 12, C_TEXT3, bg);
+
+	// the click buttons
+	float bw = BOTTOM_W / 2 - 10;
+	bool left = (touching && s_zone == ZONE_LEFT) || osGetTime() < s_clickUntil, right = touching && s_zone == ZONE_RIGHT;
+	rrect(8, CLICK_Y, bw, CLICK_H, 10, left ? C_CARD_HI : C_CARD);
+	text(8 + bw / 2, CLICK_Y + 10, 0.46f, C_TEXT, C2D_AlignCenter, "Left click");
+	rrect(BOTTOM_W / 2 + 2, CLICK_Y, bw, CLICK_H, 10, right ? C_CARD_HI : C_CARD);
+	text(BOTTOM_W / 2 + 2 + bw / 2, CLICK_Y + 10, 0.46f, C_TEXT, C2D_AlignCenter, "Right click");
+}
+
+// ---- typing on the Mac ----------------------------------------------------------------------
+
+#define TYPE_MOD_Y 112
+#define TYPE_MOD_H 30
+#define TYPE_ROW1 150
+#define TYPE_ROW2 190
+#define TYPE_KEY_H 34
+
+// Keys that work live: held on the Mac while held here, so they repeat. Two rows of four
+// columns; the arrows share the last two.
+static const struct { const char *key, *label; Glyph g; float x, y, w; } s_typeKeys[] = {
+	{"esc", "Esc", GLYPH_NONE, 8, TYPE_ROW1, 71.5f},
+	{"tab", "Tab", GLYPH_NONE, 85.5f, TYPE_ROW1, 71.5f},
+	{"delete", "Delete", GLYPH_NONE, 163, TYPE_ROW1, 71.5f},
+	{"return", "Return", GLYPH_NONE, 240.5f, TYPE_ROW1, 71.5f},
+	{"space", "Space", GLYPH_NONE, 8, TYPE_ROW2, 149},
+	{"left", "", GLYPH_ARROW_LEFT, 163, TYPE_ROW2, 34.25f},
+	{"up", "", GLYPH_ARROW_UP, 201.25f, TYPE_ROW2, 34.25f},
+	{"down", "", GLYPH_ARROW_DOWN, 239.5f, TYPE_ROW2, 34.25f},
+	{"right", "", GLYPH_ARROW_RIGHT, 277.75f, TYPE_ROW2, 34.25f},
+};
+#define TYPE_KEYS (int)(sizeof s_typeKeys / sizeof *s_typeKeys)
+
+static bool s_typeMods[4];   // cmd, shift, opt, ctrl: for the next key
+static int s_typeKey = -1;   // the key held down on the screen
+static bool s_typeLive;      // it's going over live input (else it went as one keystroke)
+static char s_typed[64];     // the start of what was sent last
+
+static void start_type(void) {
+	memset(s_typeMods, 0, sizeof s_typeMods);
+	s_typeKey = -1;
+	s_typed[0] = 0;
+	input_start();
+	s_screen = SCR_TYPE;
+}
+
+static void stop_type(void) {
+	input_stop();
+	s_screen = SCR_MAIN;
+}
+
+// "cmd+shift+left": the modifiers that are on, then the key.
+static void type_combo(const char *key, char *out, size_t size) {
+	static const int order[] = {3, 2, 1, 0};  // macOS order: ctrl, opt, shift, cmd
+	out[0] = 0;
+	for (int i = 0; i < 4; i++)
+		if (s_typeMods[order[i]]) snprintf(out + strlen(out), size - strlen(out), "%s+", s_modNames[order[i]]);
+	snprintf(out + strlen(out), size - strlen(out), "%s", key);
+}
+
+// The system keyboard, then the text goes to the Mac in one go.
+static void type_text(void) {
+	InputHeld none = {0};
+	input_hold(&none);
+	SwkbdState kb;
+	char text[512];
+	swkbdInit(&kb, SWKBD_TYPE_WESTERN, 2, sizeof text - 1);
+	swkbdSetHintText(&kb, "Type something to send to your Mac");
+	swkbdSetFeatures(&kb, SWKBD_MULTILINE);
+	swkbdSetValidation(&kb, SWKBD_NOTEMPTY, 0, 0);
+	if (swkbdInputText(&kb, text, sizeof text) != SWKBD_BUTTON_CONFIRM) return;
+	press_text(text);
+	copy(s_typed, sizeof s_typed, text);
+	char *nl = strchr(s_typed, '\n');
+	if (nl) *nl = 0;
+}
+
+static void type_update(u32 down, u32 held, touchPosition touch, bool tapped, touchPosition tap) {
+	if (down & KEY_B) {
+		stop_type();
+		return;
+	}
+	if (tapped && in(tap, 0, 0, 90, 32)) {
+		stop_type();
+		return;
+	}
+	if (tapped && in(tap, 8, 38, 304, 50)) {
+		type_text();
+		return;
+	}
+	InputInfo info;
+	input_info(&info);
+	bool live = info.state == INPUT_LIVE && info.through;
+	if (down & KEY_TOUCH) {
+		for (int i = 0; i < 4; i++)
+			if (in(touch, 8 + i * 77.5f, TYPE_MOD_Y, 71.5f, TYPE_MOD_H)) s_typeMods[i] = !s_typeMods[i];
+		for (int i = 0; i < TYPE_KEYS; i++) {
+			if (!in(touch, s_typeKeys[i].x, s_typeKeys[i].y, s_typeKeys[i].w, TYPE_KEY_H)) continue;
+			s_typeKey = i;
+			s_typeLive = live;
+			if (!live) {
+				// no live input (an older Mac, or not through yet): one press, as a keystroke
+				char combo[64];
+				type_combo(s_typeKeys[i].key, combo, sizeof combo);
+				press_combo(combo);
+				memset(s_typeMods, 0, sizeof s_typeMods);
+			}
+		}
+	}
+	InputHeld h = {0};
+	if (s_typeKey >= 0 && !(held & KEY_TOUCH)) {
+		if (s_typeLive) memset(s_typeMods, 0, sizeof s_typeMods);  // they were for that key
+		s_typeKey = -1;
+	}
+	if (s_typeKey >= 0 && s_typeLive) {
+		char combo[64];
+		type_combo(s_typeKeys[s_typeKey].key, combo, sizeof combo);
+		held_add_combo(&h, combo);
+	}
+	// the +Control Pad works as arrow keys here too
+	static const struct { u32 bit; const char *key; } arrows[] = {
+		{KEY_DUP, "up"}, {KEY_DDOWN, "down"}, {KEY_DLEFT, "left"}, {KEY_DRIGHT, "right"},
+	};
+	for (int i = 0; i < 4; i++) {
+		if (live && (held & arrows[i].bit)) held_add(&h, arrows[i].key);
+		else if (!live && (down & arrows[i].bit)) press_combo(arrows[i].key);
+	}
+	input_hold(&h);
+}
+
+static void type_draw(void) {
+	header("Type on your Mac", "\xE2\x80\xB9 Done", false);
+	rrect(8, 38, 304, 50, 12, C_CARD);
+	tile(20, 51, C_ORANGE, GLYPH_KEYS, "");
+	if (s_typed[0]) {
+		char sub[96];
+		snprintf(sub, sizeof sub, "Sent \xE2\x80\x9C%s\xE2\x80\x9D", s_typed);
+		text(54, 43, 0.55f, C_TEXT, 0, "Type something\xE2\x80\xA6");
+		text_fit(54, 65, 0.4f, C_TEXT2, 0, 230, sub);
+	} else {
+		text(54, 54, 0.55f, C_TEXT, 0, "Type something\xE2\x80\xA6");
+	}
+	glyph(GLYPH_CHEVRON_R, 297, 63, 12, C_TEXT3, C_CARD);
+
+	text(20, 95, 0.38f, C_TEXT2, 0, "ADD TO THE NEXT KEY");
+	for (int i = 0; i < 4; i++) {
+		float x = 8 + i * 77.5f;
+		rrect(x, TYPE_MOD_Y, 71.5f, TYPE_MOD_H, 8, s_typeMods[i] ? C_ORANGE : C_CARD);
+		text(x + 71.5f / 2, TYPE_MOD_Y + 8, 0.42f, s_typeMods[i] ? C_BG : C_TEXT, C2D_AlignCenter, s_modLabels[i]);
+	}
+	for (int i = 0; i < TYPE_KEYS; i++) {
+		float x = s_typeKeys[i].x, y = s_typeKeys[i].y, w = s_typeKeys[i].w;
+		u32 bg = i == s_typeKey ? C_CARD_HI : C_CARD;
+		rrect(x, y, w, TYPE_KEY_H, 8, bg);
+		if (s_typeKeys[i].g != GLYPH_NONE) glyph(s_typeKeys[i].g, x + w / 2, y + TYPE_KEY_H / 2, 13, C_TEXT, bg);
+		else text(x + w / 2, y + 9, 0.46f, C_TEXT, C2D_AlignCenter, s_typeKeys[i].label);
 	}
 }
 
@@ -2072,6 +2894,11 @@ static void pair_draw_bottom(void) {
 
 // ---- main --------------------------------------------------------------------------
 
+// Nothing stays held on the Mac while the 3DS sleeps or sits in the HOME Menu.
+static void on_apt(APT_HookType hook, void *param) {
+	if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP) input_release();
+}
+
 int main(void) {
 	gfxInitDefault();
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
@@ -2088,6 +2915,10 @@ int main(void) {
 	macapad_init();
 	config_load();
 	pads_load();
+	controller_load();
+	APT_CheckNew3DS(&s_isNew3ds);
+	aptHookCookie aptCookie;
+	aptHook(&aptCookie, on_apt, NULL);
 	if (g_config.token[0]) start_main();
 	else start_find(NULL);
 
@@ -2116,7 +2947,7 @@ int main(void) {
 			tapped = !s_dragging && !s_longFired;
 		}
 
-		if (s_screen == SCR_MAIN) status_get(&s_st);
+		if (s_screen != SCR_FIND && s_screen != SCR_QR && s_screen != SCR_PAIR) status_get(&s_st);
 		if (s_st.online && !s_wasOnline) icons_retry();
 		s_wasOnline = s_st.online;
 		u8 *px;
@@ -2160,8 +2991,14 @@ int main(void) {
 			if (tapped && s_screen == SCR_LIST && !in(tap, 0, 0, 90, 32)) list_tap(tap);
 			break;
 		case SCR_KEYS:
-			if (down & KEY_B) open_kind_menu();
+			if (down & KEY_B) keys_back();
 			else if (tapped) keys_tap(tap);
+			break;
+		case SCR_PAD:
+			pad_update(down, held, touch, released);
+			break;
+		case SCR_TYPE:
+			type_update(down, held, touch, tapped, tap);
 			break;
 		}
 
@@ -2172,6 +3009,7 @@ int main(void) {
 		if (s_screen == SCR_FIND) find_draw_top();
 		else if (s_screen == SCR_QR) qr_draw_top();
 		else if (s_screen == SCR_PAIR) pair_draw_top();
+		else if (s_screen == SCR_PAD) pad_draw_top();
 		else draw_dashboard();
 
 		C2D_TargetClear(bottom, C_BG);
@@ -2183,10 +3021,14 @@ int main(void) {
 		case SCR_MAIN: pad_draw(); break;
 		case SCR_LIST: list_draw(); break;
 		case SCR_KEYS: keys_draw(); break;
+		case SCR_PAD: pad_draw_bottom(); break;
+		case SCR_TYPE: type_draw(); break;
 		}
 		C3D_FrameEnd(0);
 	}
 
+	input_stop();
+	aptUnhook(&aptCookie);
 	scan_finish(&s_scan);
 	stop_qr();
 	pair_finish(&s_pair);

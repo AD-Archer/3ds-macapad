@@ -4,6 +4,9 @@
 - [Requirements](#requirements)
 - [Install](#install)
 - [Using it](#using-it)
+- [Use as a controller](#use-as-a-controller)
+- [Type on your Mac](#type-on-your-mac)
+- [Keep Mac awake and Mouse jiggler](#keep-mac-awake-and-mouse-jiggler)
 - [Buttons](#buttons)
 - [Files on the SD card](#files-on-the-sd-card)
 - [Building](#building)
@@ -27,7 +30,8 @@ and stays filled while the Mac is away (the song card says "Connecting…" until
 ## Requirements
 
 - [Macapad](https://ad-archer.github.io/Macapad/) 0.4 or later on your Mac (it needs `GET /api/status`). The 3DS's
-  "Find your Mac" screen shows a QR code for that page too.
+  "Find your Mac" screen shows a QR code for that page too. The controller, keys that repeat while held, and the Keep
+  Mac awake and Mouse jiggler switches need 1.0.
 - The 3DS and the Mac on the same Wi-Fi. A 3DS can't join a tailnet.
 
 ## Install
@@ -72,6 +76,50 @@ Taps go to the Mac in order. Any made while one is still on its way are sent tog
 run of taps doesn't wait a round trip each. If the Mac's address changes, the 3DS looks for the same Mac on the network
 again after a few failed polls.
 
+## Use as a controller
+
+**START → Use as a controller** turns the 3DS into a gamepad, mouse and keyboard for the Mac. Pick a preset, then
+**Start**:
+
+| Preset | Buttons | Sticks |
+|---|---|---|
+| **Mouse & keys** | A left click, B right click, X Esc, Y Return, L/R back/forward (Cmd+[ / Cmd+]), ZL/ZR previous/next tab, START Spotlight, SELECT Cmd+Tab, +Control Pad arrow keys | Circle Pad moves the pointer, C-Stick scrolls |
+| **Retro games** | RetroArch's default keys: +Control Pad arrows, A X, B Z, X S, Y A, L Q, R W, START Return, SELECT Right Shift, ZL F1 (menu), ZR Space (fast-forward) | Circle Pad arrows |
+| **PC games** | A Space (jump), B C (crouch), X R (reload), Y E (use), L right click (aim), R left click (shoot), ZL Shift (run), ZR Q, START Esc, SELECT Tab, +Control Pad 1–4 | Circle Pad W A S D, C-Stick mouse look |
+
+In every preset the touch screen is a trackpad: drag to move the pointer (faster swipes go further), tap to click.
+Drag up and down the strip at its right to scroll, and the two buttons under it are a left and right click (hold
+them down, or hold a button that clicks, like A in Mouse & keys, while you drag to drag things).
+
+The top screen lists what every button does, lights each one while it's held, and says whether it's getting through
+to the Mac. **To stop, press START and SELECT together** (every other button is in use); tapping **‹ Done** works
+too. START and SELECT wait a moment before they count, so pressing both to stop doesn't press either on the Mac.
+
+**Change a button** sets any button to a key, keys held together (like Cmd+Tab), a left, right or middle click, or
+nothing; a stick can move the pointer, scroll, or be arrow keys or W A S D. Changes are kept per preset; **Back to
+preset** undoes them. ZL, ZR and the C-Stick only show on a New 3DS.
+
+It works live: the 3DS asks the Mac for a session (`POST /api/input/session`) and then sends everything it holds over
+UDP, the whole state each time, about 20 times a second while anything is held and twice a second otherwise. A lost
+packet can't leave a key stuck, and the Mac lets go of everything if it stops hearing from the 3DS. The 3DS lets go
+itself when you stop, close the lid or press HOME. If Macapad is paused or outside its hours, the screen says so and
+tries again every few seconds.
+
+## Type on your Mac
+
+**START → Type on your Mac** opens the 3DS keyboard (**Type something…**) and types what you write on the Mac. Under
+it are Esc, Tab, Delete, Return, Space and the arrows, which repeat while held like a real keyboard (so do the
++Control Pad's arrows). Tap Command, Shift, Option or Control first to add it to the next key, like Command then
+Left. With a Mac older than 1.0 the keys still work, one press at a time.
+
+## Keep Mac awake and Mouse jiggler
+
+Two switches at the top of the START menu. **Keep Mac awake** stops the Mac's screen from sleeping; **Mouse jiggler**
+nudges the pointer when the Mac has been idle for a while, so Slack and Teams never show you as away. They show what
+the Mac says right now (and until when, if it was turned on for a while), so they stay right when they're changed on
+the Mac or from another device. Keys for them, and for the new window sizes, Siri, brightness, accessibility and
+clicks, are in "Pick a Mac action"; the Keep Mac awake and Mouse jiggler keys get a green dot while they're on.
+
 ## Buttons
 
 | Button | Does |
@@ -82,7 +130,7 @@ again after a few failed polls.
 | D-pad ↑ ↓ | volume |
 | Y | mute |
 | SELECT | edit mode (tap any key to change it) |
-| START | menu: pages (jump to, add, rename, remove), edit keys, 12/24-hour clock, forget this Mac, refresh, quit |
+| START | menu: use as a controller, type on your Mac, keep Mac awake, mouse jiggler, pages (jump to, add, rename, remove), edit keys, 12/24-hour clock, forget this Mac, refresh, quit |
 
 ## Files on the SD card
 
@@ -92,6 +140,7 @@ Everything lives in `sd:/3ds/macapad/`:
 |---|---|
 | `config.json` | the Mac's address, this 3DS's device token, the clock setting |
 | `pads.json` | your pages and keys |
+| `controller.json` | the controller's preset, and the buttons you changed in each |
 | `status.json` | the last clock offset, weather and stats, for the dashboard before the Mac answers (per Mac) |
 | `catalog-actions.json`, `catalog-apps.json`, `catalog-shortcuts.json` | the pickers' lists, with when they were fetched (per Mac) |
 | `icons/<bundleId>.png` | cached app icons |
@@ -151,8 +200,9 @@ and commits it if it ever changes (say, after renaming the repo).
 
 | File | What |
 |---|---|
-| `source/main.c` | screens: find, pair, dashboard + pad (with page swipes), key editor, grouped lists, menu |
-| `source/macapad.c` | config and pads on the SD card, status / press / icon / catalog threads (presses batched, connections kept open), the status snapshot, scanning, pairing, the catalog cache |
+| `source/main.c` | screens: find, pair, dashboard + pad (with page swipes), key editor, grouped lists, menu, controller, typing |
+| `source/input.c` | live input: the session, and a thread that sends what's held and moved over UDP and reads the Mac's answers |
+| `source/macapad.c` | config, pads and the controller presets on the SD card, status / press / icon / catalog threads (presses batched, connections kept open), the status snapshot, scanning, pairing, the catalog cache |
 | `source/http.c` | a small HTTP/1.1 client on the 3DS socket API, with keep-alive and Content-Length framing, plus the subnet scan |
 | `source/gfx.c` | rounded rects, circles, outlines, text that fits, the icon set, PNG → texture, camera preview |
 | `source/qrscan.c` | the outer camera at 640×480: a capture thread and a QR-decoding thread, for pairing |

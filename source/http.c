@@ -40,18 +40,22 @@ static int start_connect(struct in_addr addr, int port) {
 	return fd;
 }
 
-// Whether a non-blocking connect has gone through. A connected socket has a peer; libctru
-// isn't sure which bits the 3DS's poll() uses for errors and hangups, so this doesn't read them.
-// SO_ERROR is the fallback when getpeername() can't say.
-static bool connected(int fd) {
-	struct sockaddr_in peer;
-	socklen_t len = sizeof peer;
-	if (getpeername(fd, (struct sockaddr *)&peer, &len) == 0) return true;
-	if (errno == ENOTCONN) return false;
+// Whether a non-blocking connect has gone through: 1 yes, 0 not yet, -1 it failed. A connected
+// socket has a peer; libctru isn't sure which bits the 3DS's poll() uses for errors and hangups,
+// so this doesn't read them. SO_ERROR comes first and a failure ends the attempt: reading it
+// clears it, and Azahar crashes when getpeername() fails (it converts the address it never got),
+// so getpeername() is only asked while nothing has gone wrong.
+static int connected(int fd) {
 	int err = 0;
-	len = sizeof err;
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return true; // can't tell; the send will
-	return err == 0;
+	socklen_t len = sizeof err;
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err != 0) {
+		errno = err;
+		return -1;
+	}
+	struct sockaddr_in peer;
+	len = sizeof peer;
+	if (getpeername(fd, (struct sockaddr *)&peer, &len) == 0) return 1;
+	return errno == ENOTCONN ? 0 : 1;  // can't tell; the send will
 }
 
 // Every connection attempt, appended to the SD card (kept small), for finding out what the
@@ -100,13 +104,14 @@ static int connect_timeout(const char *host, int port, int timeout_ms) {
 			net_log(host, port, "no answer in %d ms", timeout_ms);
 			break;
 		}
-		if (connected(fd)) {
+		int state = connected(fd);
+		if (state > 0) {
 			int one = 1;  // small requests go out at once instead of waiting to be coalesced
 			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 			return fd;
 		}
-		if (p.revents & (POLLERR | POLLNVAL)) {
-			net_log(host, port, "refused: revents 0x%x", p.revents);
+		if (state < 0 || (p.revents & (POLLERR | POLLNVAL))) {
+			net_log(host, port, "refused: errno %d, revents 0x%x", state < 0 ? errno : 0, p.revents);
 			break;
 		}
 		if (osGetTime() >= deadline) {
@@ -370,7 +375,7 @@ int net_scan(int port, ScanHit *hits, int max, volatile int *progress, volatile 
 				int k = map[i];
 				done[k] = true;
 				pending--;
-				bool ok = !(live[i].revents & (POLLERR | POLLNVAL)) && connected(fds[k].fd);
+				bool ok = !(live[i].revents & (POLLERR | POLLNVAL)) && connected(fds[k].fd) > 0;
 				if (ok && found < max) {
 					struct in_addr a = {htonl(ips[k])};
 					snprintf(hits[found].host, sizeof hits[found].host, "%s", inet_ntoa(a));

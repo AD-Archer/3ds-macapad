@@ -170,6 +170,106 @@ void pads_save(void) {
 	json_decref(root);
 }
 
+// ---- the 3DS as a controller ----------------------------------------------------
+
+Controller g_controller;
+
+static const char *s_presetIds[PRESETS] = {"mouse", "retro", "pc"};
+static const char *s_presetNames[PRESETS] = {"Mouse & keys", "Retro games", "PC games"};
+static const char *s_presetAbout[PRESETS] = {
+	"Pointer, clicks and arrow keys",
+	"RetroArch's keyboard keys",
+	"W A S D, mouse look, jump",
+};
+static const char *s_controlIds[CTL_COUNT] = {
+	"a", "b", "x", "y", "l", "r", "zl", "zr", "up", "down", "left", "right", "start", "select", "circle", "cstick",
+};
+
+// Each preset: what every control does, and what that's for (shown next to it).
+typedef struct { const char *binding, *note; } Job;
+static const Job s_presets[PRESETS][CTL_COUNT] = {
+	{  // Mouse & keys: the touch screen is a trackpad too
+		[CTL_A] = {"click:left"}, [CTL_B] = {"click:right"}, [CTL_X] = {"esc"}, [CTL_Y] = {"return"},
+		[CTL_L] = {"cmd+[", "Back"}, [CTL_R] = {"cmd+]", "Forward"},
+		[CTL_ZL] = {"ctrl+shift+tab", "Previous tab"}, [CTL_ZR] = {"ctrl+tab", "Next tab"},
+		[CTL_UP] = {"up"}, [CTL_DOWN] = {"down"}, [CTL_LEFT] = {"left"}, [CTL_RIGHT] = {"right"},
+		[CTL_START] = {"cmd+space", "Spotlight"}, [CTL_SELECT] = {"cmd+tab", "Switch apps"},
+		[CTL_CIRCLE] = {"pointer"}, [CTL_CSTICK] = {"scroll"},
+	},
+	{  // Retro games: RetroArch's default keyboard keys
+		[CTL_A] = {"x"}, [CTL_B] = {"z"}, [CTL_X] = {"s"}, [CTL_Y] = {"a"},
+		[CTL_L] = {"q"}, [CTL_R] = {"w"}, [CTL_ZL] = {"f1", "Menu"}, [CTL_ZR] = {"space", "Fast-forward"},
+		[CTL_UP] = {"up"}, [CTL_DOWN] = {"down"}, [CTL_LEFT] = {"left"}, [CTL_RIGHT] = {"right"},
+		[CTL_START] = {"return", "Start"}, [CTL_SELECT] = {"rshift", "Select"},
+		[CTL_CIRCLE] = {"arrows"}, [CTL_CSTICK] = {"none"},
+	},
+	{  // PC games
+		[CTL_A] = {"space", "Jump"}, [CTL_B] = {"c", "Crouch"}, [CTL_X] = {"r", "Reload"}, [CTL_Y] = {"e", "Use"},
+		[CTL_L] = {"click:right", "Aim"}, [CTL_R] = {"click:left", "Shoot"},
+		[CTL_ZL] = {"shift", "Run"}, [CTL_ZR] = {"q"},
+		[CTL_UP] = {"1"}, [CTL_RIGHT] = {"2"}, [CTL_DOWN] = {"3"}, [CTL_LEFT] = {"4"},
+		[CTL_START] = {"esc", "Menu"}, [CTL_SELECT] = {"tab", "Map"},
+		[CTL_CIRCLE] = {"wasd", "Walk"}, [CTL_CSTICK] = {"pointer", "Look"},
+	},
+};
+
+const char *preset_name(int preset) { return s_presetNames[preset]; }
+const char *preset_about(int preset) { return s_presetAbout[preset]; }
+
+const char *preset_binding(int preset, Control c) {
+	const char *b = s_presets[preset][c].binding;
+	return b ? b : "none";
+}
+
+const char *preset_note(int preset, Control c) {
+	const char *n = s_presets[preset][c].note;
+	return n ? n : "";
+}
+
+const char *control_binding(Control c) {
+	const char *b = g_controller.changes[g_controller.preset][c];
+	return *b ? b : preset_binding(g_controller.preset, c);
+}
+
+void control_set(Control c, const char *binding) {
+	char *b = g_controller.changes[g_controller.preset][c];
+	copy(b, sizeof g_controller.changes[0][0], strcmp(binding, preset_binding(g_controller.preset, c)) ? binding : "");
+}
+
+int preset_changes(int preset) {
+	int n = 0;
+	for (int c = 0; c < CTL_COUNT; c++) n += g_controller.changes[preset][c][0] != 0;
+	return n;
+}
+
+void controller_load(void) {
+	memset(&g_controller, 0, sizeof g_controller);
+	json_t *root = json_load_file(DATA_DIR "/controller.json", 0, NULL);
+	if (!root) return;
+	json_t *changes = json_object_get(root, "changes");
+	for (int p = 0; p < PRESETS; p++) {
+		if (!strcmp(jstr(root, "preset"), s_presetIds[p])) g_controller.preset = p;
+		json_t *mine = json_object_get(changes, s_presetIds[p]);
+		for (int c = 0; c < CTL_COUNT; c++)
+			copy(g_controller.changes[p][c], sizeof g_controller.changes[p][c], jstr(mine, s_controlIds[c]));
+	}
+	json_decref(root);
+}
+
+void controller_save(void) {
+	ensure_dirs();
+	json_t *changes = json_object();
+	for (int p = 0; p < PRESETS; p++) {
+		json_t *mine = json_object();
+		for (int c = 0; c < CTL_COUNT; c++)
+			if (g_controller.changes[p][c][0]) json_object_set_new(mine, s_controlIds[c], json_string(g_controller.changes[p][c]));
+		json_object_set_new(changes, s_presetIds[p], mine);
+	}
+	json_t *root = json_pack("{s:s,s:o}", "preset", s_presetIds[g_controller.preset], "changes", changes);
+	json_dump_file(root, DATA_DIR "/controller.json", JSON_INDENT(2));
+	json_decref(root);
+}
+
 // ---- talking to the Mac ------------------------------------------------------
 
 // conn may be NULL for a one-off connection.
@@ -355,6 +455,13 @@ static void apply_status(json_t *root) {
 	st.off = json_is_object(off);
 	copy(st.offMessage, sizeof st.offMessage, st.off ? jstr(off, "message") : "");
 
+	json_t *awake = json_object_get(root, "keepAwake"), *jiggler = json_object_get(root, "jiggler");
+	st.hasSwitches = json_is_object(awake) || json_is_object(jiggler);
+	st.keepAwake = json_is_true(json_object_get(awake, "on"));
+	st.keepAwakeUntil = st.keepAwake ? parse_iso(jstr(awake, "until")) : 0;
+	st.jiggler = json_is_true(json_object_get(jiggler, "on"));
+	st.jigglerUntil = st.jiggler ? parse_iso(jstr(jiggler, "until")) : 0;
+
 	LightLock_Lock(&s_lock);
 	s_status = st;
 	LightLock_Unlock(&s_lock);
@@ -492,6 +599,12 @@ void press_key(const PadKey *key) {
 }
 
 void press_action(const char *actionId) { enqueue(step("action", "id", actionId)); }
+
+void press_text(const char *text) { enqueue(step("typeText", "text", text)); }
+
+void press_combo(const char *keys) { enqueue(step("keystroke", "keys", keys)); }
+
+void press_switch(const char *type, bool on) { enqueue(json_pack("{s:s,s:b}", "type", type, "on", on)); }
 
 // Takes every queued step; NULL when there are none.
 static json_t *take_steps(void) {
@@ -745,6 +858,8 @@ static Thread spawn(ThreadFunc fn, void *arg) {
 	if (!t) t = threadCreate(fn, arg, 32 * 1024, prio + 1, -2, false);
 	return t;
 }
+
+Thread macapad_spawn(ThreadFunc fn, void *arg) { return spawn(fn, arg); }
 
 static bool s_started;
 static void catalog_thread(void *arg);
